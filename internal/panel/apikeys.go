@@ -36,13 +36,14 @@ func (p *Panel) apiKeysList(w http.ResponseWriter, r *http.Request) {
 	// 主密钥行：只为让运维看到「还有一把不受域限制的钥匙存在」，不提供编辑。
 	if primary := p.apiKey(); primary != "" {
 		rows = append(rows, map[string]any{
-			"name":      "主密钥（config.api_key）",
-			"key":       apikeys.Redact(primary),
-			"realm":     "", // 不限域
+			"name":        "主密钥（config.api_key）",
+			"id":          apikeys.Fingerprint(primary),
+			"key":         apikeys.Redact(primary),
+			"realm":       "", // 不限域
 			"realm_label": apikeys.RealmLabel(""),
-			"primary":   true,
-			"disabled":  false,
-			"note":      "不限域；面板鉴权与跨域运维用。不可在此删除。",
+			"primary":     true,
+			"disabled":    false,
+			"note":        "不限域；面板鉴权与跨域运维用。不可在此删除。",
 		})
 	}
 
@@ -52,7 +53,10 @@ func (p *Panel) apiKeysList(w http.ResponseWriter, r *http.Request) {
 			shown = k.Key
 		}
 		rows = append(rows, map[string]any{
-			"name":         k.Name,
+			"name": k.Name,
+			// id 是定位用句柄：脱敏模式下明文不下发，前端只能用 id 提交写操作
+			// （否则拿到的是 "wb-a******(1)" 这种形态，删除永远 404）。
+			"id":           k.ID(),
 			"key":          shown,
 			"realm":        k.Realm,
 			"realm_label":  apikeys.RealmLabel(k.Realm),
@@ -140,8 +144,8 @@ func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 		// 而不是假装成功（回滚会让「刚建的密钥突然 401」更难理解）。
 		log.Printf("panel: api key 落盘失败（内存已生效，重启会丢）: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": true, "key": created.Key, "name": created.Name, "realm": created.Realm,
-			"model_filter": describeFilter(created.AllowModels, created.DenyModels),
+			"ok": true, "key": created.Key, "id": created.ID(), "name": created.Name, "realm": created.Realm,
+			"model_filter":  describeFilter(created.AllowModels, created.DenyModels),
 			"persist_error": err.Error(),
 		})
 		return
@@ -149,10 +153,11 @@ func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("panel: 新建 API 密钥 name=%q realm=%s filter=[%s]（%s）",
 		created.Name, created.Realm, describeFilter(created.AllowModels, created.DenyModels), apikeys.Redact(created.Key))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":    true,
-		"key":   created.Key, // 明文只在这里返回一次
-		"name":  created.Name,
-		"realm": created.Realm,
+		"ok":           true,
+		"key":          created.Key,  // 明文只在这里返回一次
+		"id":           created.ID(), // 后续删除/轮换/改域都用它定位（列表默认脱敏）
+		"name":         created.Name,
+		"realm":        created.Realm,
 		"allow_models": created.AllowModels,
 		"deny_models":  created.DenyModels,
 		"model_filter": describeFilter(created.AllowModels, created.DenyModels),
@@ -160,7 +165,7 @@ func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiKeyUpdate 修改一把密钥的可变字段：
-// {key(定位), name?, realm?, disabled?, note?, allow_models?, deny_models?}。
+// {key|id(定位), name?, realm?, disabled?, note?, allow_models?, deny_models?}。
 // key 本身不可改（对外契约）——换值请用 rotate。
 //
 // 模型过滤字段的「不改」与「清空」要区分开：JSON 里字段缺失 = 不改；
@@ -171,6 +176,7 @@ func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Key         string    `json:"key"`
+		ID          string    `json:"id"`
 		Name        *string   `json:"name"`
 		Realm       *string   `json:"realm"`
 		Disabled    *bool     `json:"disabled"`
@@ -182,16 +188,18 @@ func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	// 面板列表里回显的是脱敏值，前端提交的 key 可能是脱敏形——此时按「仅一个匹配」
-	// 或 name 定位会歧义，故要求前端始终带完整明文/或由前端保存明文。这里做兜底：
-	// 若定位失败且只传了 name，就按 name 唯一定位（便于手改）。
-	target := body.Key
-	if _, found := p.cfg.APIKeys.Lookup(target); !found {
-		if body.Name != nil {
-			if match, ok := p.findKeyByName(*body.Name); ok {
-				target = match
-			}
+	// 定位顺序：明文 key → 不透明 id → 唯一 name。
+	// id 是列表脱敏模式下的唯一可用句柄（见 apikeys.Fingerprint）；name 兜底
+	// 只在「前端手里既没明文也没 id」的手改场景生效，且必须唯一。
+	target, found := p.resolveKeyTarget(body.Key, body.ID)
+	if !found && body.Name != nil {
+		if match, ok := p.findKeyByName(*body.Name); ok {
+			target, found = match, true
 		}
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, keyNotFoundMsg)
+		return
 	}
 	updated, err := p.cfg.APIKeys.Update(target, apikeys.KeyUpdate{
 		Name:        body.Name,
@@ -218,42 +226,54 @@ func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiKeyRemove 删除一把密钥：{key}。
+// apiKeyRemove 删除一把密钥：{key} 或 {id}。
 func (p *Panel) apiKeyRemove(w http.ResponseWriter, r *http.Request) {
 	if !p.keysWritable(w) {
 		return
 	}
 	var body struct {
 		Key string `json:"key"`
+		ID  string `json:"id"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	if err := p.cfg.APIKeys.Remove(body.Key); err != nil {
+	target, found := p.resolveKeyTarget(body.Key, body.ID)
+	if !found {
+		writeErr(w, http.StatusNotFound, keyNotFoundMsg)
+		return
+	}
+	if err := p.cfg.APIKeys.Remove(target); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
 	if err := p.persistKeys(); err != nil {
 		log.Printf("panel: api key 落盘失败: %v", err)
 	}
-	log.Printf("panel: 删除 API 密钥 %s", apikeys.Redact(body.Key))
+	log.Printf("panel: 删除 API 密钥 %s", apikeys.Redact(target))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// apiKeyRotate 轮换密钥值：{key} → 返回新明文，旧值立即失效。
+// apiKeyRotate 轮换密钥值：{key} 或 {id} → 返回新明文，旧值立即失效。
 func (p *Panel) apiKeyRotate(w http.ResponseWriter, r *http.Request) {
 	if !p.keysWritable(w) {
 		return
 	}
 	var body struct {
 		Key string `json:"key"`
+		ID  string `json:"id"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	rotated, err := p.cfg.APIKeys.Rotate(body.Key)
+	target, found := p.resolveKeyTarget(body.Key, body.ID)
+	if !found {
+		writeErr(w, http.StatusNotFound, keyNotFoundMsg)
+		return
+	}
+	rotated, err := p.cfg.APIKeys.Rotate(target)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -263,7 +283,7 @@ func (p *Panel) apiKeyRotate(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: 轮换 API 密钥 name=%q → %s（旧值已失效）", rotated.Name, apikeys.Redact(rotated.Key))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "key": rotated.Key, "name": rotated.Name, "realm": rotated.Realm,
+		"ok": true, "key": rotated.Key, "id": rotated.ID(), "name": rotated.Name, "realm": rotated.Realm,
 	})
 }
 
@@ -284,6 +304,36 @@ func (p *Panel) persistKeys() error {
 		return nil
 	}
 	return p.cfg.SaveKeys(p.cfg.APIKeys.List())
+}
+
+// keyNotFoundMsg 定位失败时的错误文案。
+//
+// 特意点出「脱敏值不能用来定位」：这个 404 最典型的成因就是前端把列表里
+// "wb-a******(1)" 这种脱敏形当成密钥值提交（历史实现正是如此，表现为
+// 「新建的密钥删不掉/停不掉/轮换不了」）。运维看到这句话能立刻对上原因，
+// 而不是以为密钥表坏了。
+const keyNotFoundMsg = "api key not found：请用列表返回的 id（或完整明文密钥）定位；脱敏展示值不可用于定位"
+
+// resolveKeyTarget 把「定位一把密钥」的两种输入（明文 key / 不透明 id）归一成
+// 明文密钥值。都定位不到时返回 false，由调用方给出 404。
+//
+// 顺序固定：先明文（精确、老前端与 curl 习惯不变），再 id（列表脱敏模式下的
+// 唯一可用句柄）。id 与明文指向同一条时结果一致，因此两条都传也不会有歧义。
+func (p *Panel) resolveKeyTarget(key, id string) (string, bool) {
+	if p.cfg.APIKeys == nil {
+		return "", false
+	}
+	if k := strings.TrimSpace(key); k != "" {
+		if _, found := p.cfg.APIKeys.Lookup(k); found {
+			return k, true
+		}
+	}
+	if v := strings.TrimSpace(id); v != "" {
+		if hit, found := p.cfg.APIKeys.ByID(v); found {
+			return hit.Key, true
+		}
+	}
+	return "", false
 }
 
 // findKeyByName 按 name 唯一定位密钥值；重名/未找到返回 false。

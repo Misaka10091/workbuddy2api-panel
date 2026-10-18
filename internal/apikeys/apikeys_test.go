@@ -231,6 +231,79 @@ func TestStoreNilSafe(t *testing.T) {
 	if _, found := s.Lookup("anything"); found {
 		t.Error("nil Lookup 命中了")
 	}
+	if _, found := s.ByID("0123456789abcdef"); found {
+		t.Error("nil ByID 命中了")
+	}
+}
+
+// TestFingerprint 指纹是「可定位但不可逆」的句柄：同一把密钥恒定，
+// 不同密钥不同，且不含明文片段（列表脱敏后前端只能靠它定位条目）。
+func TestFingerprint(t *testing.T) {
+	a := "wb-0123456789abcdef0123456789abcdef"
+	b := "wb-fedcba9876543210fedcba9876543210"
+
+	if Fingerprint(a) != Fingerprint(a) {
+		t.Fatal("同一密钥的指纹不稳定（前端两次刷新就无法继续定位同一行）")
+	}
+	if Fingerprint(a) == Fingerprint(b) {
+		t.Fatal("不同密钥指纹相同")
+	}
+	id := Fingerprint(a)
+	if len(id) != 16 {
+		t.Errorf("指纹长度=%d want 16", len(id))
+	}
+	if strings.Contains(id, "wb-") || strings.Contains(a, id) {
+		t.Errorf("指纹泄漏了明文片段: %q", id)
+	}
+	k := Key{Key: a}
+	if k.ID() != id {
+		t.Error("Key.ID() 与 Fingerprint 口径不一致")
+	}
+}
+
+// TestStoreByID 面板列表脱敏后只能拿到 id：ByID 必须能定位到条目。
+func TestStoreByID(t *testing.T) {
+	s, errs := New([]Key{
+		{Name: "cn", Key: "wb-cnkey00000000001", Realm: RealmCN},
+		{Name: "gl", Key: "wb-glkey00000000001", Realm: RealmGlobal, Disabled: true},
+	})
+	if len(errs) != 0 {
+		t.Fatalf("errs=%v", errs)
+	}
+
+	hit, found := s.ByID(Fingerprint("wb-glkey00000000001"))
+	if !found || hit.Name != "gl" || !hit.Disabled {
+		t.Fatalf("ByID 定位失败: found=%v key=%+v", found, hit)
+	}
+	// 大小写/空白容错：前端从 data-* 属性里读出来的值不该因为多余空格失效。
+	if _, found := s.ByID("  " + strings.ToUpper(Fingerprint("wb-cnkey00000000001")) + " "); !found {
+		t.Error("ByID 未做 trim/小写归一")
+	}
+	// 脱敏值不是 id，必须定位失败（否则「删不掉」的根因会被掩盖成误删）。
+	if _, found := s.ByID(Redact("wb-cnkey00000000001")); found {
+		t.Error("ByID 把脱敏值当成了定位句柄")
+	}
+	if _, found := s.ByID(""); found {
+		t.Error("空 id 命中了")
+	}
+}
+
+// TestRemoveByIDAfterRotation id 随密钥值派生：轮换后旧 id 失效、新 id 可定位，
+// 这正是「表里那一行换了钥匙」的正确语义。
+func TestStoreIDTracksRotation(t *testing.T) {
+	s, _ := New([]Key{{Name: "r", Key: "wb-oldkey00000000001", Realm: RealmCN}})
+	oldID := Fingerprint("wb-oldkey00000000001")
+
+	rot, err := s.Rotate("wb-oldkey00000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := s.ByID(oldID); found {
+		t.Error("轮换后旧 id 仍能定位")
+	}
+	if hit, found := s.ByID(rot.ID()); !found || hit.Key != rot.Key {
+		t.Errorf("轮换后新 id 定位失败: found=%v key=%+v", found, hit)
+	}
 }
 
 // TestRealmLabel 标签口径（面板与日志共用，避免两处各写一份中文）。

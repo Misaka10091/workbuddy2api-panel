@@ -176,6 +176,48 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// TestAppJSKeyRowsLocateByID 密钥表行内控件必须用服务端下发的 id 定位。
+//
+// 根因回归（「创建的 key 无法删除」）：列表默认脱敏，行里 `data-*` 曾经存的是
+// 展示值 "wb-a******(1)"，删除/停用/轮换把它当 key 提交 → 服务端按明文比对
+// 必然 404。现在定位句柄统一是 id（不透明指纹）。
+func TestAppJSKeyRowsLocateByID(t *testing.T) {
+	src := string(appJS)
+
+	// 不能再用展示值/旧属性名当定位句柄。
+	for _, bad := range []string{
+		`data-k="`,
+		`dataset.k`,
+		`data-ak-realm=`,
+		`dataset.akRealm`,
+	} {
+		if strings.Contains(src, bad) {
+			t.Errorf("app.js 仍用 %s 定位密钥行（脱敏后必然定位失败）", bad)
+		}
+	}
+
+	// 必须：行内控件带 id、事件处理读 id、写操作提交 id。
+	for _, want := range []string{
+		`const rid = esc(k.id || '')`,
+		`data-akrow="' + rid + '"`,
+		`sel.dataset.akrow`,
+		`b.dataset.akrow`,
+		`JSON.stringify({ id })`,                  // 删除 / 轮换
+		`body: JSON.stringify({ id, disabled`,     // 停用 / 启用
+		`body: JSON.stringify({ id, allow_models`, // 模型过滤
+		`akKeys.find(k => k.id === id)`,           // 行内取当前规则
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("app.js 缺少 %q（密钥行定位/写操作应统一走 id）", want)
+		}
+	}
+
+	// 复制不能把脱敏值写进剪贴板。
+	if !strings.Contains(src, "api_keys?reveal=1") {
+		t.Error("app.js 缺少按需取明文的复制路径（脱敏模式下会复制出星号）")
+	}
+}
+
 // TestPanelIndexHasApiKeyDialog 新建密钥必须是弹框（不是页内表单），
 // 且弹框里要含模型过滤的两个输入与实时预览容器。
 func TestPanelIndexHasApiKeyDialog(t *testing.T) {

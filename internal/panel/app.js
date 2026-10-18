@@ -1164,18 +1164,22 @@ function renderApiKeys() {
     const st = disabled ? '<span class="tag bad">已停用</span>' : '<span class="tag ok">生效中</span>';
     const realmTag = '<span class="realm-tag">' + esc(akRealmLabel(k.realm)) + '</span>';
     // 主密钥行只读：不提供改域/停用/删除/轮换（它是面板的进门钥匙）。
+    // 行内控件的定位句柄一律用 id（服务端下发的不透明指纹），**不用** k.key：
+    // 列表默认脱敏，k.key 此时是 "wb-a******(1)"，拿它提交删除/轮换只会 404
+    // （历史 bug：新建的密钥在刷新页面后删不掉）。
+    const rid = esc(k.id || '');
     const acts = primary
       ? '<span class="note">主密钥不可在此修改</span>'
       : (disabled
-        ? '<button class="xs primary" data-ak="enable" data-k="' + esc(k.key) + '">启用</button>'
-        : '<button class="xs ghost" data-ak="disable" data-k="' + esc(k.key) + '">停用</button>') +
-        '<button class="xs ghost" data-ak="filter" data-k="' + esc(k.key) + '" title="修改可用模型（白/黑名单，支持通配符）">模型</button>' +
-        '<button class="xs ghost" data-ak="rotate" data-k="' + esc(k.key) + '" title="生成新密钥值，旧值立即失效">轮换</button>' +
-        '<button class="xs ghost" data-ak="copy" data-k="' + esc(k.key) + '">复制</button>' +
-        '<button class="xs ghost danger" data-ak="remove" data-k="' + esc(k.key) + '">删除</button>';
+        ? '<button class="xs primary" data-ak="enable" data-akrow="' + rid + '">启用</button>'
+        : '<button class="xs ghost" data-ak="disable" data-akrow="' + rid + '">停用</button>') +
+        '<button class="xs ghost" data-ak="filter" data-akrow="' + rid + '" title="修改可用模型（白/黑名单，支持通配符）">模型</button>' +
+        '<button class="xs ghost" data-ak="rotate" data-akrow="' + rid + '" title="生成新密钥值，旧值立即失效">轮换</button>' +
+        '<button class="xs ghost" data-ak="copy" data-akrow="' + rid + '">复制</button>' +
+        '<button class="xs ghost danger" data-ak="remove" data-akrow="' + rid + '">删除</button>';
     const realmSel = primary
       ? realmTag
-      : '<select class="xs" data-ak-realm="' + esc(k.key) + '">' +
+      : '<select class="xs" data-akrow="' + rid + '">' +
           [['cn', '国内版'], ['global', '国际版'], ['', '不限域']].map(([v, l]) =>
             '<option value="' + v + '"' + ((k.realm || '') === v ? ' selected' : '') + '>' + l + '</option>').join('') +
         '</select>';
@@ -1266,9 +1270,22 @@ if ($('btnAkReveal')) {
   };
 }
 
+// akCopyKey 复制某把密钥的明文。
+//
+// 为什么不能直接复制屏上的值：列表默认脱敏（akReveal=false），那格显示的是
+// "wb-a******(1)"——复制出来毫无用处。这里显式取一次明文，只用于本次剪贴板
+// 写入，不改变列表的脱敏状态（不会顺手把整页切到明文）。
+async function akCopyKey(id, shown) {
+  if (akReveal && shown) return copyText(shown);
+  const d = await api('api_keys?reveal=1');
+  const hit = (d.keys || []).find(k => k.id === id);
+  if (!hit) throw new Error('该密钥已不存在，请刷新列表');
+  return copyText(hit.key);
+}
+
 // akEditFilter 用 prompt 快速编辑模型过滤（单行两条列表，运维改一两个 pattern 够用）。
 // 复杂编辑走「新建」弹框的完整体验；这里追求「列表页就地改」。
-async function akEditFilter(key, curAllow, curDeny) {
+async function akEditFilter(id, curAllow, curDeny) {
   const allow = prompt(
     '白名单（逗号分隔，支持 * 和 ?；留空 = 不限制）\n例：glm-*, gpt-6*',
     (curAllow || []).join(', '));
@@ -1287,7 +1304,7 @@ async function akEditFilter(key, curAllow, curDeny) {
   try {
     await api('api_keys/update', {
       method: 'POST',
-      body: JSON.stringify({ key, allow_models: allowList, deny_models: denyList }),
+      body: JSON.stringify({ id, allow_models: allowList, deny_models: denyList }),
     });
     toast('模型过滤已更新（立即生效）', 'ok');
     loadApiKeys();
@@ -1297,12 +1314,12 @@ async function akEditFilter(key, curAllow, curDeny) {
 if ($('akBody')) {
   // 改绑定版本：change 即提交（下拉选择比逐个弹窗确认更顺手）。
   $('akBody').addEventListener('change', async ev => {
-    const sel = ev.target.closest('select[data-ak-realm]');
+    const sel = ev.target.closest('select[data-akrow]');
     if (!sel) return;
     try {
       await api('api_keys/update', {
         method: 'POST',
-        body: JSON.stringify({ key: sel.dataset.akRealm, realm: sel.value }),
+        body: JSON.stringify({ id: sel.dataset.akrow, realm: sel.value }),
       });
       toast('已改为 ' + akRealmLabel(sel.value) + '（立即生效）', 'ok');
       loadApiKeys();
@@ -1311,18 +1328,22 @@ if ($('akBody')) {
   $('akBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-ak]');
     if (!b) return;
-    const act = b.dataset.ak, key = b.dataset.k;
+    const act = b.dataset.ak;
+    // 定位一律走 id：列表默认脱敏，data 属性里的 key 是 "wb-a******(1)" 这种
+    // 形态，拿它当定位依据会 404（见服务端 resolveKeyTarget）。
+    const id = b.dataset.akrow;
+    const row = akKeys.find(k => k.id === id);
     if (act === 'remove' && !confirm('删除后使用该密钥的客户端会立即 401，且不可恢复。确认删除？')) return;
     if (act === 'rotate' && !confirm('轮换会立即废弃旧密钥值，使用旧值的客户端会 401。确认轮换？')) return;
     if (act === 'copy') {
-      copyText(key).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
+      // 脱敏模式下不能复制屏上那个值（复制出来是星号），单独取一次明文。
+      akCopyKey(id, row && row.key).then(() => toast('已复制', 'ok'), e => toast(e.message || '复制失败', 'err'));
       return;
     }
     if (act === 'filter') {
       // 就地改模型过滤：取该行当前规则作默认值。
-      const row = akKeys.find(k => k.key === key);
       await akLoadModelIDs();
-      await akEditFilter(key, row && row.allow_models, row && row.deny_models);
+      await akEditFilter(id, row && row.allow_models, row && row.deny_models);
       return;
     }
     b.disabled = true;
@@ -1330,16 +1351,15 @@ if ($('akBody')) {
       if (act === 'disable' || act === 'enable') {
         await api('api_keys/update', {
           method: 'POST',
-          body: JSON.stringify({ key, disabled: act === 'disable' }),
+          body: JSON.stringify({ id, disabled: act === 'disable' }),
         });
         toast(act === 'disable' ? '已停用（该密钥请求会 401）' : '已启用', 'ok');
       } else if (act === 'rotate') {
-        const r = await api('api_keys/rotate', { method: 'POST', body: JSON.stringify({ key }) });
-        const row = akKeys.find(k => k.key === key);
+        const r = await api('api_keys/rotate', { method: 'POST', body: JSON.stringify({ id }) });
         akShowCreated(r.name, r.realm, r.key, row && row.model_filter);
         akReveal = true;
       } else if (act === 'remove') {
-        await api('api_keys/remove', { method: 'POST', body: JSON.stringify({ key }) });
+        await api('api_keys/remove', { method: 'POST', body: JSON.stringify({ id }) });
         toast('已删除', 'ok');
       }
       loadApiKeys();

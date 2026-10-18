@@ -24,6 +24,7 @@ package apikeys
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -434,6 +435,32 @@ func (s *Store) Lookup(token string) (Key, bool) {
 	return hit, found
 }
 
+// ByID 按不透明标识（Fingerprint）定位一把密钥。
+//
+// 存在的理由：面板列表默认**脱敏**回显（见 Redact），前端手里往往只有
+// "wb-a******(1)" 这种形态；拿它去比对明文必然不命中，于是删除/轮换/改域
+// 全部 404（运维视角就是「删不掉」）。id 是 key 的 SHA-256 前 16 位，不可逆、
+// 不泄漏明文，但足以在写操作里精确定位到唯一一条。
+func (s *Store) ByID(id string) (Key, bool) {
+	if s == nil || id == "" {
+		return Key{}, false
+	}
+	want := strings.ToLower(strings.TrimSpace(id))
+	if want == "" {
+		return Key{}, false
+	}
+	snap := s.p.Load()
+	if snap == nil {
+		return Key{}, false
+	}
+	for _, k := range snap.list {
+		if Fingerprint(k.Key) == want {
+			return k, true
+		}
+	}
+	return Key{}, false
+}
+
 // Replace 整体替换密钥列表（面板保存时调用），返回校验错误列表。
 // 非法条目被跳过（与 New 同语义），其余条目照常生效。
 func (s *Store) Replace(keys []Key) []error {
@@ -623,6 +650,24 @@ func (s *Store) Rotate(token string) (Key, error) {
 // RealmFor 返回某把已鉴权密钥的域绑定（""=不限）。供 handler 在请求上下文中
 // 传递域约束——单独成函数是为了让调用点读起来就是「这把密钥绑哪个域」。
 func (k Key) RealmFor() string { return k.Realm }
+
+// Fingerprint 返回密钥的不透明标识：SHA-256 的前 16 个 hex 字符（64 bit）。
+//
+// 用途是**定位**而不是鉴定：面板列表脱敏后（Redact）前端只剩 "wb-a******(1)"，
+// 用它提交写操作（删除/轮换/停用/改域）永远不会命中；而把明文下发到列表又等于
+// 把凭证摊在共享屏/截图里。id 是这两者之间的折中：由明文单向派生、不可逆、
+// 不随展示形态变化（同一个 key 的 id 永远相同），只在本进程的内存列表里出现。
+//
+// 为什么截 64 bit 而不是全长：列表里通常几把到几十把密钥，64 bit 的碰撞概率
+// 可以忽略；短 id 也让 data-* 属性与日志读起来不刺眼。定位用的值不承担任何
+// 密码学信任（能改配置的人本来就能读明文）。
+func Fingerprint(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:8])
+}
+
+// ID 该条目的不透明标识（见 Fingerprint）。面板用它替代明文定位条目。
+func (k Key) ID() string { return Fingerprint(k.Key) }
 
 // Redact 返回脱敏后的密钥（保留前缀与末 4 位，供面板列表展示）。
 //

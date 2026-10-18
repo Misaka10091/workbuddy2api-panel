@@ -48,14 +48,23 @@ func setSecurityHeaders(w http.ResponseWriter) {
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(indexHTML)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
+//
+// 为什么两个静态资源都带 Cache-Control: no-store：app.js 与 index.html 是
+// **嵌进二进制**的，URL 里没有可用来破缓存的版本号。升级后浏览器若还拿旧
+// app.js 配新后端，就会出现「前端死代码 + 后端已改契约」的错位——本次
+// 「新建的密钥删不掉」修好后，老缓存会让修复看起来没生效（前端仍提交脱敏
+// 展示值）。面板是运维工具、页面只有一份 193KB 脚本，关缓存换「重启即生效」
+// 是划算的取舍。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
 }

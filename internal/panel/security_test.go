@@ -95,6 +95,20 @@ func TestAppScriptServed(t *testing.T) {
 	}
 }
 
+// app.js 与 index.html 必须禁缓存：它们嵌在二进制里、URL 无版本号，
+// 升级后浏览器若还用旧 app.js 配新后端，就会出现「后端修好了、前端还在发旧请求」
+// 的错位（典型症状：为某次接口契约变更添加的修复看起来完全没生效）。
+func TestPanelAssetsAreNotCached(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Errorf("%s: Cache-Control=%q want no-store（旧前端配新后端会静默失效）", path, got)
+		}
+	}
+}
+
 // UID 白名单：拒绝路径穿越与异常字符，放行真实 UUID 形态。
 func TestValidUID(t *testing.T) {
 	ok := []string{

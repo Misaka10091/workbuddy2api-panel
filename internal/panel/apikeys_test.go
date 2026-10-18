@@ -263,6 +263,159 @@ func TestAPIKeyRemove(t *testing.T) {
 	}
 }
 
+// TestAPIKeyRemoveByID 回归：面板默认脱敏，前端只能拿到 id —— 用 id 必须能删。
+//
+// 历史 bug（issue：创建的 key 无法删除）：列表回显 "wb-c******(01)"，前端直接把
+// 屏上那个脱敏值当 key 提交，服务端按明文比对必然不命中 → 404，运维看到的就是
+// 「新建的密钥删不掉」。这里把「列表 → 取 id → 删除」这条真实路径钉住。
+func TestAPIKeyRemoveByID(t *testing.T) {
+	key := "wb-cnkey00000000001"
+	p, store, saved := newKeyPanel(t, []apikeys.Key{{Name: "要删的", Key: key, Realm: apikeys.RealmCN}})
+
+	// 1) 默认列表（脱敏）：拿到 id 与脱敏后的展示值
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("GET", "/panel/api/api_keys", nil))
+	var listed struct {
+		Keys []struct {
+			Name string `json:"name"`
+			ID   string `json:"id"`
+			Key  string `json:"key"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var id, shown string
+	for _, k := range listed.Keys {
+		if k.Name == "要删的" {
+			id, shown = k.ID, k.Key
+		}
+	}
+	if id == "" {
+		t.Fatal("列表未下发 id（脱敏模式下前端将无法定位条目）")
+	}
+	if shown == key {
+		t.Fatal("默认列表泄漏了明文")
+	}
+	if id == shown {
+		t.Fatal("id 就是展示值（应当是不透明指纹）")
+	}
+
+	// 2) 用展示值删除 → 必须失败且不误删（定位不到就不是 200）
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys/remove", map[string]any{"key": shown}))
+	if rec.Code != 404 {
+		t.Fatalf("用脱敏值删除 code=%d want 404 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, found := store.Lookup(key); !found {
+		t.Fatal("脱敏值定位失败却把密钥删掉了")
+	}
+
+	// 3) 用 id 删除 → 200，store 与落盘都同步
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys/remove", map[string]any{"id": id}))
+	if rec.Code != 200 {
+		t.Fatalf("用 id 删除 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, found := store.Lookup(key); found {
+		t.Error("删除后仍能查到")
+	}
+	// 落盘也要跟上：SaveKeys 被调用过一次，且写出的表里不再有这把密钥。
+	if *saved == nil {
+		t.Error("删除未落盘（SaveKeys 未被调用）")
+	}
+	for _, k := range *saved {
+		if k.Key == key {
+			t.Error("落盘内容里仍含被删的密钥")
+		}
+	}
+}
+
+// TestAPIKeyUpdateByID 停用/改域/改过滤同样走 id（否则刷新页面后这些按钮全 404）。
+func TestAPIKeyUpdateByID(t *testing.T) {
+	key := "wb-cnkey00000000001"
+	p, store, _ := newKeyPanel(t, []apikeys.Key{{Name: "x", Key: key, Realm: apikeys.RealmCN}})
+	id := apikeys.Fingerprint(key)
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys/update", map[string]any{
+		"id": id, "disabled": true, "realm": "global",
+	}))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Lookup(key)
+	if !got.Disabled || got.Realm != apikeys.RealmGlobal {
+		t.Errorf("按 id 更新未生效: disabled=%v realm=%q", got.Disabled, got.Realm)
+	}
+
+	// 定位不到的 id → 404（而不是静默成功）
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys/update", map[string]any{
+		"id": "0000000000000000", "disabled": false,
+	}))
+	if rec.Code != 404 {
+		t.Errorf("未知 id code=%d want 404", rec.Code)
+	}
+}
+
+// TestAPIKeyRotateByID 轮换返回新明文与新 id；旧 id 随旧值一起失效。
+func TestAPIKeyRotateByID(t *testing.T) {
+	key := "wb-oldkey00000000001"
+	p, store, _ := newKeyPanel(t, []apikeys.Key{{Name: "r", Key: key, Realm: apikeys.RealmGlobal}})
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys/rotate", map[string]any{
+		"id": apikeys.Fingerprint(key),
+	}))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Key   string `json:"key"`
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Realm string `json:"realm"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Key == "" || resp.Key == key {
+		t.Fatalf("轮换未返回新值: %q", resp.Key)
+	}
+	if resp.ID != apikeys.Fingerprint(resp.Key) {
+		t.Errorf("响应里的 id 不是新密钥的指纹: %q", resp.ID)
+	}
+	if resp.Realm != apikeys.RealmGlobal {
+		t.Errorf("轮换丢了域绑定: %q", resp.Realm)
+	}
+	if _, found := store.Lookup(key); found {
+		t.Error("旧密钥仍有效")
+	}
+}
+
+// TestAPIKeyCreateReturnsID 创建响应要带 id：新建完立刻删除/改域靠它定位。
+func TestAPIKeyCreateReturnsID(t *testing.T) {
+	p, _, _ := newKeyPanel(t, nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, keyReq("POST", "/panel/api/api_keys", map[string]any{
+		"name": "新建", "realm": "cn",
+	}))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Key string `json:"key"`
+		ID  string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID == "" || resp.ID != apikeys.Fingerprint(resp.Key) {
+		t.Fatalf("创建响应 id=%q 与 key=%q 不匹配", resp.ID, resp.Key)
+	}
+}
+
 // TestAPIKeysNotAvailableWithoutStore 未启用多密钥（nil Store）→ 501，不 panic。
 func TestAPIKeysNotAvailableWithoutStore(t *testing.T) {
 	p := New(Config{Version: "test", APIKey: "panel-key"})
