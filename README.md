@@ -266,6 +266,31 @@ curl -s http://localhost:7863/healthz
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
 
+命名约定（默认值，脚本与 compose 共用；不一致时以环境变量为准）：
+
+| 项 | 默认值 | 来源 |
+|---|---|---|
+| 镜像名 | `misaka10092/workbuddy2api-panel` | `IMAGE_NAME`（Docker Hub 命名空间 + 仓库名，须全小写） |
+| 标签 | `latest` | `IMAGE_TAG`，不传即 `latest` |
+| 容器名 | `workbuddy2api` | `container_name` |
+
+换名字/标签不用改文件：
+
+```bash
+IMAGE_TAG=v1 docker compose up -d --build
+IMAGE_NAME=my/api IMAGE_TAG=v1 docker compose up -d --build
+
+# 或走封装脚本（同一套默认值）
+./scripts/docker.sh env                 # 只看解析结果：IMAGE_NAME / IMAGE_TAG
+./scripts/docker.sh build               # docker build -t misaka10092/workbuddy2api-panel:latest
+./scripts/docker.sh build --tag=v1.2.3  # 指定标签
+./scripts/docker.sh up                  # compose up -d --build
+./scripts/docker.sh push                # 推到 misaka10092/workbuddy2api-panel:latest（需 docker login）
+```
+
+> docker 仓库名必须全小写：写 `Misaka10092/…` 时脚本会自动转成 `misaka10092/…` 并提示，
+> compose 直接写大写则会被 docker 拒绝（`repository name must be lowercase`）。
+
 常用运维命令：
 
 ```bash
@@ -779,10 +804,15 @@ http://127.0.0.1:7863/panel/
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
+镜像与标签默认值固定为 `misaka10092/workbuddy2api-panel:latest`，
+由 `docker-compose.yml` 的 `image:` 与 `scripts/docker.sh` 共同保证；
+需要自定义时设置 `IMAGE_NAME` / `IMAGE_TAG`（或脚本参数 `--image=` / `--tag=`）。
+
 ### 工具脚本
 
 | 脚本 | 用途 |
 |---|---|
+| `./scripts/docker.sh` | Docker 封装：`env` / `build` / `up` / `run` / `push`，默认镜像 `misaka10092/workbuddy2api-panel:latest` |
 | `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |

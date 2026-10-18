@@ -1,0 +1,6 @@
+# 统一 LF：容器内脚本（login.sh / signin.sh / credit.sh / scripts/docker.sh）
+# 若有 CRLF 会导致 shebang 失效（bad interpreter: /bin/bash^M）。
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf

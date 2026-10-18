@@ -31,6 +31,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   # github.repository 自动小写化，得到 ghcr.io/linguo2625469/workbuddy2api-panel
+  # 注：registry 已提供 owner 命名空间，故发布名只用 <owner>/<repo>；
+  # 本地构建默认名是 misaka10092/workbuddy2api-panel:latest（Docker Hub 命名空间），见 scripts/docker.sh。
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:

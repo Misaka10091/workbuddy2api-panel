@@ -1,5 +1,10 @@
 services:
   wb2api:
+    # 镜像命名默认 = misaka10092/workbuddy2api-panel:latest（Docker Hub 命名空间 + 仓库名 + latest）。
+    # 与 scripts/docker.sh 共用同一套默认值；要换名字/标签写进 .env 或直接传环境变量：
+    #   IMAGE_NAME=my/api IMAGE_TAG=v1 docker compose up -d --build
+    # 注：docker 要求仓库名全小写，写 Misaka10092/… 会被 docker 直接拒绝。
+    image: ${IMAGE_NAME:-misaka10092/workbuddy2api-panel}:${IMAGE_TAG:-latest}
     build: .
     container_name: workbuddy2api
     restart: unless-stopped
