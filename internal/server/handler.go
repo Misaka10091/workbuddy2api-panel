@@ -178,8 +178,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-// keyScope 一次鉴权的产物：这把密钥被允许用哪个域（"" = 不限）。
-// 放在请求上下文里，供 chatCompletions / models 读取域约束。
+// keyScope 一次鉴权的产物：这把密钥被允许用哪个域（"" = 不限）与哪些模型。
+// 放在请求上下文里，供 chatCompletions / models 读取约束。
 type keyScope struct {
 	// Realm 密钥绑定的域（""=不限）。
 	Realm string
@@ -189,6 +189,8 @@ type keyScope struct {
 	Primary bool
 	// KeyID 密钥值本身（只用于在请求日志里做**脱敏后的**标识，勿直接打印）。
 	KeyID string
+	// Models 模型过滤规则（nil = 不限制）。主密钥恒为 nil。
+	Models *apikeys.ModelFilter
 }
 
 type keyScopeKey struct{}
@@ -224,7 +226,8 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusUnauthorized, code, msg)
 			return
 		}
-		if scope.Realm != "" || scope.Name != "" {
+		// 只在确有必要时塞 context（主密钥无任何约束就跳过，少一次分配）。
+		if scope.Realm != "" || scope.Name != "" || scope.Models.Active() {
 			r = r.WithContext(context.WithValue(r.Context(), keyScopeKey{}, scope))
 		}
 		next(w, r)
@@ -254,7 +257,12 @@ func (h *Handler) authenticate(r *http.Request) (keyScope, bool, bool) {
 	if k.Disabled {
 		return keyScope{}, false, true
 	}
-	return keyScope{Realm: k.Realm, Name: k.Name, KeyID: apikeys.Redact(k.Key)}, true, false
+	return keyScope{
+		Realm:  k.Realm,
+		Name:   k.Name,
+		KeyID:  apikeys.Redact(k.Key),
+		Models: k.Filter(),
+	}, true, false
 }
 
 // bearerToken 从 Authorization 头剥出 Bearer 值（无则空串）。
@@ -378,22 +386,47 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 //
-// 密钥绑了域时只列该域的模型（并用**裸 id**，不加 "cn:"/"global:" 前缀）：
-// 客户端拿到的列表就是它能调的全部，不必记前缀、也看不到自己无权用的另一域模型。
-// 密钥不限域（主密钥 / 未启用多密钥）时按历史行为两域并列、带前缀。
+// 三层收敛，越靠后越严：
+//  1. 域：密钥绑了域就只列该域（并用**裸 id**，不加 "cn:"/"global:" 前缀）；
+//     不限域（主密钥/未启用多密钥）按历史行为两域并列、带前缀。
+//  2. 密钥的模型白/黑名单（支持通配符）——客户端看到什么就必须能调什么，
+//     列出被禁的模型只会让它在请求阶段吃 403。
+//  3. 空列表也照常 200：客户端据此知道「当前没有可用模型」，而不是去猜。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	scope := scopeFrom(r)
+	var list []map[string]any
 	if scope.Realm != "" {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"object": "list",
-			"data":   h.modelListForRealm(scope.Realm),
-		})
-		return
+		list = h.modelListForRealm(scope.Realm)
+	} else {
+		list = h.modelList()
+	}
+	list = filterModelsByKey(list, scope.Models)
+	if list == nil {
+		list = []map[string]any{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
+}
+
+// filterModelsByKey 按密钥的模型白/黑名单过滤列表条目。
+//
+// filter 为 nil/未生效时原样返回**同一个切片**（不复制）：主密钥与未限制密钥
+// 走的还是原来的路径，零额外开销。过滤时逐条判定 id 的裸名（条目可能带
+// "cn:"/"global:" 前缀，ModelFilter.Allows 内部会剥）。
+func filterModelsByKey(list []map[string]any, filter *apikeys.ModelFilter) []map[string]any {
+	if !filter.Active() {
+		return list
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, entry := range list {
+		id, _ := entry["id"].(string)
+		if filter.Allows(id) {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // modelListForRealm 只产出单域模型，id 为裸名（无 realm 前缀）。
@@ -766,6 +799,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		realm = scope.Realm
+	}
+	// 密钥级模型过滤（白/黑名单，支持通配符）：命中黑名单或不在白名单 → 403。
+	//
+	// 为什么用 403 而不是 404「模型不存在」：后者会让客户端以为模型下线、
+	// 转而去别的模型重试（甚至回头找运维），而真实原因是「这把密钥没这个权限」。
+	// 403 + 明确文案能让人一次看懂该找谁改配置。
+	//
+	// 判定用**裸模型名**：前缀属于路由协议，过滤规则写在模型维度上。
+	if !scope.Models.Allows(bareModel) {
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
+			fmt.Sprintf("model %q is not allowed for this API key", bareModel))
+		return
 	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {

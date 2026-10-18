@@ -123,7 +123,7 @@ func TestStoreDisabledStillFound(t *testing.T) {
 func TestStoreUpdateRealm(t *testing.T) {
 	s, _ := New([]Key{{Name: "x", Key: "wb-realmchange00001", Realm: "cn"}})
 	realm := "global"
-	updated, err := s.Update("wb-realmchange00001", nil, &realm, nil, nil)
+	updated, err := s.Update("wb-realmchange00001", KeyUpdate{Realm: &realm})
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestStoreUpdateRealm(t *testing.T) {
 	}
 	// 非法域必须报错且不改动现值。
 	bad := "jp"
-	if _, err := s.Update("wb-realmchange00001", nil, &bad, nil, nil); err == nil {
+	if _, err := s.Update("wb-realmchange00001", KeyUpdate{Realm: &bad}); err == nil {
 		t.Error("Update 非法域 err=nil want error")
 	}
 	if got, _ := s.Lookup("wb-realmchange00001"); got.Realm != RealmGlobal {

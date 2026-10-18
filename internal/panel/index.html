@@ -932,12 +932,34 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-apikeys" hidden>
       <div class="box">
         <header>
-          <h3>新建密钥 <span class="hint">每把密钥绑定一个域：用它调的请求只会落到该域账号上</span></h3>
+          <h3>密钥列表 <span class="hint">每把密钥绑定一个域，并可限制可用模型（支持通配符）</span></h3>
           <span class="grow"></span>
-          <span class="note" id="akNote"></span>
+          <span class="note" id="akListNote">—</span>
+          <button class="xs" id="btnAkReveal">显示明文</button>
+          <button class="xs" id="btnAkReload">刷新</button>
+          <button class="xs primary" id="btnAkNew">新建密钥</button>
         </header>
-        <div class="pad">
-          <div class="grid3">
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>名称</th><th>密钥</th><th>绑定版本</th><th>可用模型</th><th>状态</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="akBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 新建密钥弹框 -->
+    <div class="veil" id="akVeil">
+      <div class="dlg" style="width:720px">
+        <header>
+          <h3>新建 API 密钥</h3>
+          <div class="hint">绑定版本决定这把密钥只能落到哪批账号；模型过滤决定它能请求哪些模型。</div>
+        </header>
+        <div class="body">
+          <div class="grid2">
             <label class="fld"><span class="lb">名称（备注用）</span>
               <input id="akName" placeholder="例如：给团队 A 的国内版">
               <span class="hint">仅用于识别，可重复</span></label>
@@ -947,37 +969,58 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <option value="global">国际版（Global）</option>
                 <option value="">不限域（可调两域，需用 cn:/global: 前缀区分）</option>
               </select>
-              <span class="hint">国内版密钥只能调 CN 账号，国际版只能调 Global 账号</span></label>
-            <label class="fld"><span class="lb">密钥值（留空自动生成）</span>
-              <input id="akKey" placeholder="留空 = 服务端随机生成">
-              <span class="hint">自定义至少 8 位、不含空白</span></label>
+              <span class="hint">国内版只调 CN 账号，国际版只调 Global 账号</span></label>
           </div>
-          <div class="hint" style="margin-bottom:10px">绑定版本是强约束：国际版密钥用裸模型名（如 <code>hy3</code>）也只会落到国际版账号；
-            若显式写了相反的域前缀（如国际版密钥调 <code>cn:hy3</code>）会直接 400，不会静默改域烧错积分。</div>
-          <button class="primary" id="btnAkCreate">创建密钥</button>
-          <span class="note" id="akCreateMsg" style="margin-left:10px"></span>
-        </div>
-      </div>
+          <label class="fld"><span class="lb">密钥值（留空自动生成）</span>
+            <input id="akKey" placeholder="留空 = 服务端随机生成">
+            <span class="hint">自定义至少 8 位、不含空白</span></label>
 
-      <div class="box">
-        <header>
-          <h3>密钥列表</h3>
-          <span class="grow"></span>
-          <span class="note" id="akListNote">—</span>
-          <button class="xs" id="btnAkReveal">显示明文</button>
-          <button class="xs" id="btnAkReload">刷新</button>
-        </header>
-        <div class="tbl-wrap">
-          <table class="acc">
-            <thead><tr>
-              <th class="mark" aria-hidden="true"></th>
-              <th>名称</th><th>密钥</th><th>绑定版本</th><th>状态</th><th>备注</th><th class="c-acts"></th>
-            </tr></thead>
-            <tbody id="akBody"></tbody>
-          </table>
+          <div class="hr"></div>
+          <div class="hint" style="margin-bottom:8px">
+            <b>模型过滤</b>（可选，留空 = 不限制）。
+            匹配对象是<b>模型 ID</b>（请求里 <code>model</code> 字段的值，如 <code>glm-5.3</code>、
+            <code>deepseek-v4.1-flash</code>），<b>不是</b>界面上显示的「名称」（如 GLM-5.3）；
+            域前缀 <code>cn:</code> / <code>global:</code> 会自动忽略，写不写都能匹配。<br>
+            支持通配符：<code>*</code> 任意长度、<code>?</code> 单字符，大小写不敏感。
+            黑名单优先于白名单，例如白名单 <code>glm-*</code> + 黑名单 <code>glm-5.1</code>
+            = 除 5.1 外的整个 GLM 系列。
+          </div>
+          <label class="fld"><span class="lb">白名单 allow（逗号或换行分隔）</span>
+            <input id="akAllow" placeholder="模型 ID，例如：glm-*, gpt-6*, hy3">
+            <span class="hint">非空时只有命中的模型可用</span></label>
+          <label class="fld"><span class="lb">黑名单 deny（逗号或换行分隔）</span>
+            <input id="akDeny" placeholder="模型 ID，例如：*-sol, gemini-*">
+            <span class="hint">命中即拒绝，优先级高于白名单</span></label>
+          <div class="hint" style="margin-bottom:4px">
+            可用模型预览（按当前绑定版本与规则实时计算；「模型」列即过滤所依据的 ID）：
+          </div>
+          <div id="akPreview" class="hint" style="line-height:1.6">—</div>
+          <div class="state err" id="akErr" hidden style="margin-top:10px"></div>
         </div>
+        <footer>
+          <span class="grow"></span>
+          <button id="btnAkCancel">取消</button>
+          <button class="primary" id="btnAkCreate">创建密钥</button>
+        </footer>
       </div>
-    </section>
+    </div>
+
+    <!-- 新建后展示明文 -->
+    <div class="veil" id="akDoneVeil">
+      <div class="dlg" style="width:560px">
+        <header><h3>密钥已创建</h3>
+          <div class="hint">明文只在这里显示一次，关闭后只能从列表「显示明文」再看。</div></header>
+        <div class="body">
+          <div class="hint" id="akDoneMeta"></div>
+          <div class="url" id="akDoneKey" style="margin-top:8px"></div>
+        </div>
+        <footer>
+          <span class="grow"></span>
+          <button id="btnAkDoneCopy">复制</button>
+          <button class="primary" id="btnAkDoneClose">完成</button>
+        </footer>
+      </div>
+    </div>
 
     <!-- 配置 -->
     <section class="view" id="view-config" hidden>

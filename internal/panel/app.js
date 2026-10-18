@@ -728,14 +728,16 @@ $('btnKeepaliveAll').onclick = () => runBatchAction(accRealm, 'keepalive');
 $('btnTravelAll').onclick = () => runBatchAction(accRealm, 'travel');
 $('btnActivityAll').onclick = () => runBatchAction(accRealm, 'activity');
 
-/* ── API 密钥（多密钥，每把绑定国内版 / 国际版）───────────────────── */
+/* ── API 密钥（多密钥，每把绑定国内版 / 国际版 + 模型过滤）────────── */
 /* 展示约定：
    - 列表默认脱敏（akReveal=false），点「显示明文」才向服务端要 ?reveal=1；
-   - 新建/轮换返回的明文只在当次弹窗里展示一次，并写进「刚创建」提示条；
+   - 新建走弹框（akVeil），创建成功后另开一个弹框（akDoneVeil）展示明文一次；
    - 主密钥（config.api_key）单列一行、标 primary、无删除按钮。 */
 let akKeys = [];
 let akReveal = false;
 let akRealms = [];
+// akModelIDs 当前所有可用模型的裸 id（按域分组），供弹框做「过滤后预览」。
+let akModelIDs = [];
 
 // akRealmLabel 用服务端给的标签（realms 数组），缺失时本地兜底。
 function akRealmLabel(value) {
@@ -744,19 +746,225 @@ function akRealmLabel(value) {
   return value === 'global' ? '国际版' : value === 'cn' ? '国内版' : '不限域';
 }
 
+// akParsePatterns 把输入框文本解析成 pattern 数组。
+// 逗号/中文逗号/换行/空白都当分隔符——运维粘贴列表时格式五花八门，
+// 为格式挑剔只会制造返工。
+function akParsePatterns(text) {
+  return String(text || '')
+    .split(/[,，\s]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+// akGlob 前端版 glob，仅用于弹框预览（后端用 Go 标准库 path.Match）。
+//
+// 为什么不引第三方库：只需要 * 与 ? 两个通配符，而 Go 侧本就是 path.Match
+// 的语义；为几十行匹配逻辑引一个 npm 依赖（还要打进 go:embed 的单文件前端）
+// 不划算。此实现的语义与 path.Match 一致（* 任意长、? 单字符、[] 族这里
+// 不支持——后端也只在前端不支持的写法上更宽松，不会出现"预览放行、请求被拒"）。
+// 一致性由 TestAppJSGlobMatchesBackendSemantics 钉住。
+function akGlob(pattern, s) {
+  let p = 0, i = 0, star = -1, mark = 0;
+  while (p < pattern.length || i < s.length) {
+    if (p < pattern.length && pattern[p] === '*') {
+      star = p; mark = i; p++;
+    } else if (p < pattern.length && i < s.length &&
+               (pattern[p] === '?' || pattern[p].toLowerCase() === s[i].toLowerCase())) {
+      p++; i++;
+    } else if (star >= 0 && mark < s.length) {
+      mark++; p = star + 1; i = mark;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// akFilterAllows 与后端 ModelFilter.Allows 同序：黑名单先判，再判白名单。
+function akFilterAllows(model, allow, deny) {
+  const m = String(model || '').toLowerCase().replace(/^(cn|global):/, '');
+  const A = (allow || []).map(p => p.toLowerCase().replace(/^(cn|global):/, ''));
+  const D = (deny || []).map(p => p.toLowerCase().replace(/^(cn|global):/, ''));
+  if (!A.length && !D.length) return true;
+  for (const p of D) if (akGlob(p, m)) return false;
+  if (!A.length) return true;
+  for (const p of A) if (akGlob(p, m)) return true;
+  return false;
+}
+
+// akFilterVerdict 带原因的判定（预览表格用）：返回 { ok, rule, kind }。
+//
+// 为什么要原因而不只是 true/false：规则写错时，"hy3 被拒" 这个信息没用，
+// "因为不在白名单里" 或 "命中了黑名单 *-flash" 才能让人立刻改对。
+// 判定顺序与 akFilterAllows 严格一致（黑名单优先），两处不能各写一套——
+// 一致性由 TestAppJSFilterVerdictMatchesAllows 钉住。
+function akFilterVerdict(model, allow, deny) {
+  const m = String(model || '').toLowerCase().replace(/^(cn|global):/, '');
+  const A = (allow || []).map(p => p.toLowerCase().replace(/^(cn|global):/, ''));
+  const D = (deny || []).map(p => p.toLowerCase().replace(/^(cn|global):/, ''));
+  if (!A.length && !D.length) return { ok: true, kind: '', rule: '' };
+  for (const p of D) {
+    if (akGlob(p, m)) return { ok: false, kind: 'deny', rule: p };
+  }
+  if (!A.length) return { ok: true, kind: '', rule: '' };
+  for (const p of A) {
+    if (akGlob(p, m)) return { ok: true, kind: 'allow', rule: p };
+  }
+  return { ok: false, kind: 'missing', rule: '' };
+}
+
+// akPreviewModels 按当前弹框里的域 + 过滤规则，算出「这个密钥能用到哪些模型」。
+//
+// 用表格而不是逗号长串：模型名长短不一，长串在弹框里折行后完全无法扫读
+// （20 个模型能占三行以上），而表格三列一眼就能看出「哪些可用、哪些被哪条规则挡了」。
+// 三列：模型 / 结果 / 原因（命中哪条规则 / 不在白名单）。被拒的也列出来——
+// 规则写错时，"哪个模型被挡、为什么"才是用户真正要看的信息。
+function akPreviewModels() {
+  const box = $('akPreview');
+  if (!box) return;
+  const realm = $('akRealm') ? $('akRealm').value : '';
+  const allow = akParsePatterns($('akAllow') ? $('akAllow').value : '');
+  const deny = akParsePatterns($('akDeny') ? $('akDeny').value : '');
+  if (!akModelIDs.length) {
+    box.innerHTML = '<div class="note" style="color:var(--ink-3)">模型目录尚未加载，创建后可在列表中查看实际可用模型</div>';
+    return;
+  }
+  const pool = realm ? akModelIDs.filter(m => m.realm === realm) : akModelIDs;
+  // 逐条算出判定 + 原因，一次遍历（模型数几十个，两次 filter 没必要）。
+  const rows = pool.map(m => {
+    const v = akFilterVerdict(m.id, allow, deny);
+    return { id: m.id, name: m.name, realm: m.realm, v };
+  });
+  const okCount = rows.filter(r => r.v.ok).length;
+
+  if (!okCount) {
+    box.innerHTML = '<div class="note" style="color:var(--bad)">' +
+      '0 / ' + pool.length + ' 个可用 —— 规则过严，该密钥将无法请求任何模型</div>' +
+      akPreviewTableHtml(rows);
+    return;
+  }
+
+  // 可用在前、被拒在后：确认规则时先看"能用的"。
+  rows.sort((a, b) => (b.v.ok - a.v.ok) || a.id.localeCompare(b.id));
+  const summary = '<div class="note" style="margin-bottom:6px">' +
+    '<b style="color:var(--ok)">' + okCount + '</b> 可用 / 共 ' + pool.length + ' 个' +
+    (okCount < pool.length ? '（<span style="color:var(--bad)">' + (pool.length - okCount) + '</span> 个被拒）' : '') +
+    '</div>';
+  box.innerHTML = summary + akPreviewTableHtml(rows);
+}
+
+// akPreviewTableHtml 渲染预览表格。
+//
+// 列：模型 ID（过滤依据，等宽字体）/ 名称（给人看）/ 结果 / 原因。
+// 把 ID 与名称并排是刻意的：两者经常不同（id=glm-5.3、name=GLM-5.3），
+// 摆在一起才能让人一眼明白「规则要写左边这列，不是右边这列」。
+//
+// 超过上限只渲染前 N 行并给出「另有 M 个」：模型可能 100+，弹框内滚动区
+// 过长反而不好用（完整清单在创建后的列表页可见）。
+function akPreviewTableHtml(rows) {
+  const LIMIT = 60;
+  const shown = rows.slice(0, LIMIT);
+  const body = shown.map(r => {
+    const reason = r.v.kind === 'deny'
+      ? '命中黑名单 <code>' + esc(r.v.rule) + '</code>'
+      : r.v.kind === 'missing'
+        ? '<span style="color:var(--ink-3)">不在白名单</span>'
+        : r.v.kind === 'allow'
+          ? '<span style="color:var(--ink-3)">白名单 <code>' + esc(r.v.rule) + '</code></span>'
+          : '<span style="color:var(--ink-3)">无规则限制</span>';
+    const tag = r.v.ok
+      ? '<span class="tag ok">可用</span>'
+      : '<span class="tag bad">拒绝</span>';
+    // 名称缺失时留空格而不是伪造（上游可能只给 id）。
+    const nm = r.name
+      ? '<span style="color:var(--ink-2)">' + esc(r.name) + '</span>'
+      : '<span style="color:var(--ink-3)">—</span>';
+    return '<tr>' +
+      '<td style="font-family:var(--mono);font-size:11.5px;white-space:nowrap">' + esc(r.id) + '</td>' +
+      '<td style="font-size:11.5px">' + nm + '</td>' +
+      '<td style="white-space:nowrap">' + tag + '</td>' +
+      '<td style="font-size:11.5px">' + reason + '</td>' +
+      '</tr>';
+  }).join('');
+  const more = rows.length > LIMIT
+    ? '<div class="note" style="color:var(--ink-3);padding:4px 6px">…另有 ' + (rows.length - LIMIT) + ' 个未列出</div>'
+    : '';
+  return '<div class="tbl-wrap" style="max-height:240px;overflow:auto;border:1px solid var(--line-soft);border-radius:7px">' +
+    '<table class="acc" style="font-size:12px;min-width:0;margin:0">' +
+    '<thead><tr>' +
+    '<th style="width:38%">模型 ID（规则依据）</th>' +
+    '<th style="width:26%">名称</th>' +
+    '<th style="width:64px">结果</th>' +
+    '<th>原因</th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table></div>' + more;
+}
+
+// akLoadModelIDs 拉一次模型目录（复用 /panel/api/models，面板已有该接口）。
+// 失败静默：预览是增强功能，拿不到就不显示，不影响创建密钥。
+//
+// 同时带上 name（展示名称）：预览表格要把「ID / 名称」并排显示，让人直接看到
+// 过滤依据的是 ID——规则写名称是最容易犯也最难自查的错。
+async function akLoadModelIDs() {
+  if (akModelIDs.length) return;
+  try {
+    const d = await api('models');
+    akModelIDs = (d.models || []).map(m => ({
+      id: String(m.id || '').replace(/^(cn|global):/, ''),
+      // 名称去掉域标注：该列只是给人看「这是哪个模型」，标注在这里是噪音。
+      name: String(m.name || '').replace(/^\[(国内版|国际版)\]\s*/, ''),
+      realm: m.realm || (String(m.id || '').startsWith('global:') ? 'global' : 'cn'),
+    }));
+  } catch (e) { akModelIDs = []; }
+}
+
+// akOpenNew 打开新建弹框（清空上次残留）。
+function akOpenNew() {
+  if (!$('akVeil')) return;
+  $('akName').value = '';
+  $('akRealm').value = 'cn';
+  $('akKey').value = '';
+  $('akAllow').value = '';
+  $('akDeny').value = '';
+  if ($('akErr')) $('akErr').hidden = true;
+  $('akVeil').classList.add('on');
+  akPreviewModels();
+  akLoadModelIDs().then(akPreviewModels);
+}
+function akCloseNew() { if ($('akVeil')) $('akVeil').classList.remove('on'); }
+
+// akShowCreated 创建成功后弹「明文一次性展示」。
+function akShowCreated(name, realm, key, filterDesc) {
+  if (!$('akDoneVeil')) {
+    // 弹框缺失（老页面缓存）：退回 toast，至少别把密钥吞掉。
+    toast('已创建，密钥：' + key, 'ok');
+    return;
+  }
+  const meta = [name || '未命名', akRealmLabel(realm)];
+  if (filterDesc) meta.push('可用模型：' + filterDesc);
+  if ($('akDoneMeta')) $('akDoneMeta').textContent = meta.join(' · ');
+  if ($('akDoneKey')) $('akDoneKey').textContent = key;
+  $('akDoneVeil').classList.add('on');
+  if (navigator.clipboard) navigator.clipboard.writeText(key).catch(() => {});
+}
+
+// akFilterCell 列表里的「可用模型」列：显示后端给的一句话摘要或「不限制」。
+function akFilterCell(k) {
+  const desc = k.model_filter || '';
+  if (!desc) return '<span style="color:var(--ink-3)">不限制</span>';
+  return '<span title="' + esc(desc) + '">' + esc(desc.length > 44 ? desc.slice(0, 44) + '…' : desc) + '</span>';
+}
+
 function renderApiKeys() {
   const tb = $('akBody');
   if (!tb) return;
   if (!akKeys.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">还没有密钥</div>上方选择「国内版」或「国际版」后点「创建密钥」</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">还没有密钥</div>点右上角「新建密钥」，选择国内版或国际版后创建</div></td></tr>';
     return;
   }
   tb.innerHTML = akKeys.map(k => {
     const primary = !!k.primary;
     const disabled = !!k.disabled;
-    const st = disabled ? '<span class="tag bad">已停用</span>'
-      : primary ? '<span class="tag ok">生效中</span>'
-      : '<span class="tag ok">生效中</span>';
+    const st = disabled ? '<span class="tag bad">已停用</span>' : '<span class="tag ok">生效中</span>';
     const realmTag = '<span class="realm-tag">' + esc(akRealmLabel(k.realm)) + '</span>';
     // 主密钥行只读：不提供改域/停用/删除/轮换（它是面板的进门钥匙）。
     const acts = primary
@@ -764,6 +972,7 @@ function renderApiKeys() {
       : (disabled
         ? '<button class="xs primary" data-ak="enable" data-k="' + esc(k.key) + '">启用</button>'
         : '<button class="xs ghost" data-ak="disable" data-k="' + esc(k.key) + '">停用</button>') +
+        '<button class="xs ghost" data-ak="filter" data-k="' + esc(k.key) + '" title="修改可用模型（白/黑名单，支持通配符）">模型</button>' +
         '<button class="xs ghost" data-ak="rotate" data-k="' + esc(k.key) + '" title="生成新密钥值，旧值立即失效">轮换</button>' +
         '<button class="xs ghost" data-ak="copy" data-k="' + esc(k.key) + '">复制</button>' +
         '<button class="xs ghost danger" data-ak="remove" data-k="' + esc(k.key) + '">删除</button>';
@@ -779,8 +988,8 @@ function renderApiKeys() {
         (k.created_at ? '<div class="id">' + esc(String(k.created_at).slice(0, 16).replace('T', ' ')) + '</div>' : '') + '</td>' +
       '<td><code style="font-size:12px">' + esc(k.key) + '</code></td>' +
       '<td>' + realmSel + '</td>' +
+      '<td style="font-size:12px">' + akFilterCell(k) + '</td>' +
       '<td>' + st + '</td>' +
-      '<td>' + (k.note ? esc(k.note) : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
       '<td class="acts">' + acts + '</td></tr>';
   }).join('');
   if ($('akListNote')) {
@@ -803,19 +1012,31 @@ async function loadApiKeys() {
   }
 }
 
-// akShowSecret 把新生成的明文醒目地摆出来（只此一次，列表刷新后变脱敏）。
-function akShowSecret(label, key) {
-  if ($('akCreateMsg')) {
-    $('akCreateMsg').innerHTML = label + '：<code style="user-select:all">' + esc(key) + '</code>';
-  }
-  if (navigator.clipboard) navigator.clipboard.writeText(key).catch(() => {});
-  toast('密钥已生成并复制到剪贴板', 'ok');
+if ($('btnAkNew')) $('btnAkNew').onclick = akOpenNew;
+if ($('btnAkCancel')) $('btnAkCancel').onclick = akCloseNew;
+if ($('btnAkDoneClose')) $('btnAkDoneClose').onclick = () => $('akDoneVeil').classList.remove('on');
+if ($('btnAkDoneCopy')) {
+  $('btnAkDoneCopy').onclick = () => {
+    const k = $('akDoneKey').textContent;
+    navigator.clipboard.writeText(k).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
+  };
 }
+// 规则输入变化即刷新预览（三条输入都接）。
+['akRealm', 'akAllow', 'akDeny'].forEach(id => {
+  if ($(id)) $(id).addEventListener('input', akPreviewModels);
+  if ($(id)) $(id).addEventListener('change', akPreviewModels);
+});
+// 点遮罩关闭弹框（点内容区不关）。
+['akVeil', 'akDoneVeil'].forEach(id => {
+  if (!$(id)) return;
+  $(id).addEventListener('click', ev => { if (ev.target === $(id)) $(id).classList.remove('on'); });
+});
 
 if ($('btnAkCreate')) {
   $('btnAkCreate').onclick = async () => {
     const b = $('btnAkCreate');
     b.disabled = true;
+    if ($('akErr')) $('akErr').hidden = true;
     try {
       const r = await api('api_keys', {
         method: 'POST',
@@ -823,15 +1044,19 @@ if ($('btnAkCreate')) {
           name: $('akName').value.trim(),
           realm: $('akRealm').value,
           key: $('akKey').value.trim(),
+          allow_models: akParsePatterns($('akAllow').value),
+          deny_models: akParsePatterns($('akDeny').value),
         }),
       });
-      akShowSecret('已创建（' + akRealmLabel(r.realm) + '）', r.key);
+      akCloseNew();
+      akShowCreated(r.name, r.realm, r.key, r.model_filter);
       if (r.persist_error) toast('落盘失败：' + r.persist_error, 'err');
-      $('akKey').value = '';
       akReveal = true;
       loadApiKeys();
-    } catch (e) { toast(e.message, 'err'); }
-    finally { b.disabled = false; }
+    } catch (e) {
+      if ($('akErr')) { $('akErr').hidden = false; $('akErr').textContent = '创建失败：' + e.message; }
+      else toast(e.message, 'err');
+    } finally { b.disabled = false; }
   };
 }
 
@@ -842,6 +1067,34 @@ if ($('btnAkReveal')) {
     $('btnAkReveal').textContent = akReveal ? '隐藏明文' : '显示明文';
     loadApiKeys();
   };
+}
+
+// akEditFilter 用 prompt 快速编辑模型过滤（单行两条列表，运维改一两个 pattern 够用）。
+// 复杂编辑走「新建」弹框的完整体验；这里追求「列表页就地改」。
+async function akEditFilter(key, curAllow, curDeny) {
+  const allow = prompt(
+    '白名单（逗号分隔，支持 * 和 ?；留空 = 不限制）\n例：glm-*, gpt-6*',
+    (curAllow || []).join(', '));
+  if (allow === null) return;           // 取消
+  const deny = prompt(
+    '黑名单（逗号分隔，优先于白名单；留空 = 不排除）\n例：*-sol, gemini-*',
+    (curDeny || []).join(', '));
+  if (deny === null) return;
+  const allowList = akParsePatterns(allow);
+  const denyList = akParsePatterns(deny);
+  // 明确告诉运维「改完这个密钥还能用几个模型」——规则写错最容易在这里静默翻车。
+  if (akModelIDs.length) {
+    const okCount = akModelIDs.filter(m => akFilterAllows(m.id, allowList, denyList)).length;
+    if (okCount === 0 && !confirm('当前规则下 0 个模型可用，该密钥将无法请求任何模型。仍要保存？')) return;
+  }
+  try {
+    await api('api_keys/update', {
+      method: 'POST',
+      body: JSON.stringify({ key, allow_models: allowList, deny_models: denyList }),
+    });
+    toast('模型过滤已更新（立即生效）', 'ok');
+    loadApiKeys();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 if ($('akBody')) {
@@ -868,6 +1121,13 @@ if ($('akBody')) {
       navigator.clipboard.writeText(key).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
       return;
     }
+    if (act === 'filter') {
+      // 就地改模型过滤：取该行当前规则作默认值。
+      const row = akKeys.find(k => k.key === key);
+      await akLoadModelIDs();
+      await akEditFilter(key, row && row.allow_models, row && row.deny_models);
+      return;
+    }
     b.disabled = true;
     try {
       if (act === 'disable' || act === 'enable') {
@@ -878,7 +1138,8 @@ if ($('akBody')) {
         toast(act === 'disable' ? '已停用（该密钥请求会 401）' : '已启用', 'ok');
       } else if (act === 'rotate') {
         const r = await api('api_keys/rotate', { method: 'POST', body: JSON.stringify({ key }) });
-        akShowSecret('已轮换，新密钥', r.key);
+        const row = akKeys.find(k => k.key === key);
+        akShowCreated(r.name, r.realm, r.key, row && row.model_filter);
         akReveal = true;
       } else if (act === 'remove') {
         await api('api_keys/remove', { method: 'POST', body: JSON.stringify({ key }) });

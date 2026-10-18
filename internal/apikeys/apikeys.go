@@ -28,6 +28,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -63,6 +64,162 @@ type Key struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// Note 备注（可选）。
 	Note string `json:"note,omitempty"`
+
+	// AllowModels / DenyModels 模型过滤（每把密钥独立）。
+	//
+	// 语义（与业界网关的常见约定一致）：
+	//   - AllowModels 为空 = 不限制（该密钥可用全部本域模型）；非空 = 白名单，
+	//     只有命中的模型可用。
+	//   - DenyModels 优先于 AllowModels：命中黑名单即拒绝，无论是否在白名单。
+	//   - 两者都为空 = 不做任何过滤（历史行为，零回归）。
+	//
+	// 匹配对象是**模型 ID**（请求体 model 字段 / 目录条目的 id），不是展示名称。
+	// 例：目录里 id="glm-5.3"、name="[国内版] GLM-5.3"——规则要写 glm-5.3，
+	// 写 "GLM-5.3" 或 "[国内版] GLM-5.3" 都匹配不上（name 是给人看的，随时可能
+	// 因上游改文案而变；id 才是调用契约）。这条边界必须钉死，否则运维按界面上
+	// 看到的名称写规则，会得到永久不匹配的静默失效。
+	//
+	// 元素支持通配符（glob 风格，大小写不敏感）：
+	//   *  匹配任意长度（含空）      glm-*     匹配 glm-5.2 / glm-5.3-flash
+	//   ?  匹配单个字符              gpt-?.?-sol
+	//   无通配符 = 精确匹配          hy3       只匹配 hy3
+	//
+	// 判定前会剥掉 "cn:"/"global:" 前缀（密钥已绑域，前缀在该密钥视角下是噪音；
+	// 用户照抄 /v1/models 的 id 也不该因此匹配不上）。
+	AllowModels []string `json:"allow_models,omitempty"`
+	DenyModels  []string `json:"deny_models,omitempty"`
+
+	// filter 编译后的过滤规则（buildSnapshot 时填充，只读共享）。
+	// 未导出：不参与 JSON 序列化，也不该被外部构造——保证配置里写的永远是
+	// 原始的 pattern 列表，而不是内部派生形态。
+	filter *ModelFilter
+}
+
+// ModelFilter 编译后的模型过滤规则。零值表示「不限制」。
+//
+// 预编译的原因：判定发生在每个 /v1/models（逐条）与每次 chat 请求上，
+// 反复解析 pattern 列表是纯浪费；且编译期能一次性剔除空串/纯空白条目。
+type ModelFilter struct {
+	allow []string // 已归一化的 pattern（小写、去域前缀）
+	deny  []string
+}
+
+// compileFilter 归一并编译 pattern 列表。
+//
+// 不在这里校验语法（返回值只有 filter）：非法 pattern 的挑拣放在 Normalize /
+// Add 的校验路径上（ValidatePatterns），这样"能不能存"与"怎么匹配"两件事分开——
+// 匹配函数永远不需要处理 error 分支。
+func compileFilter(allow, deny []string) *ModelFilter {
+	f := &ModelFilter{
+		allow: normalizePatterns(allow),
+		deny:  normalizePatterns(deny),
+	}
+	if len(f.allow) == 0 && len(f.deny) == 0 {
+		return nil
+	}
+	return f
+}
+
+// normalizePatterns 去空白、去域前缀、转小写（通配符匹配大小写不敏感）。
+func normalizePatterns(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		// 用户可能照抄 /v1/models 的 "cn:glm-5.2"：剥掉域前缀再匹配裸名。
+		p = strings.TrimPrefix(p, "cn:")
+		p = strings.TrimPrefix(p, "global:")
+		out = append(out, p)
+	}
+	return out
+}
+
+// Active 报告该过滤是否真的生效（空规则 = 不限制）。
+func (f *ModelFilter) Active() bool {
+	return f != nil && (len(f.allow) > 0 || len(f.deny) > 0)
+}
+
+// Allows 报告裸模型名是否被允许。filter 为 nil 时恒 true（不限制）。
+//
+// 判定顺序：先黑名单（命中即拒），再白名单（非空则必须命中）。
+// 这个顺序让「白名单 glm-* + 黑名单 glm-5.1」这种写法能表达「除某一版之外的
+// 整个系列」——是运维最常用的组合。
+func (f *ModelFilter) Allows(model string) bool {
+	if !f.Active() {
+		return true
+	}
+	m := normalizeModelName(model)
+	for _, p := range f.deny {
+		if globMatch(p, m) {
+			return false
+		}
+	}
+	if len(f.allow) == 0 {
+		return true
+	}
+	for _, p := range f.allow {
+		if globMatch(p, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeModelName 归一化模型名：去空白、转小写、剥域前缀。
+// pattern 侧走 normalizePatterns，两侧用同一套归一化才不会「写的和判的不一致」。
+func normalizeModelName(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	m = strings.TrimPrefix(m, "cn:")
+	m = strings.TrimPrefix(m, "global:")
+	return m
+}
+
+// Filter 返回该密钥编译后的过滤规则（nil = 不限制）。
+func (k Key) Filter() *ModelFilter { return k.filter }
+
+// ModelAllowed 便捷判定：该密钥是否允许某个模型。
+func (k Key) ModelAllowed(model string) bool { return k.filter.Allows(model) }
+
+// globMatch glob 风格匹配（**大小写不敏感**），支持 * 与 ?。
+//
+// 直接用标准库 path.Match 而不是自己写回溯匹配器：
+//   - 语义完全够用。path.Match 的 '* 不跨 /' 约束在这里不成立——模型名不可能
+//     含 '/'，所以分隔符差异被消掉了；
+//   - 正确性有保证。手写版本实测踩过两个坑（'*' 吞空串、尾部 '*' 未消费），
+//     都是靠测试才发现；标准库没有这类风险；
+//   - 非法 pattern 返回 error。以前我声称"glob 没有非法形态"，其实 '[' 未闭合
+//     就是非法（path.Match 会报 syntax error）。这里 error 当"不匹配"处理，
+//     并在保存时就由 ValidatePatterns 把非法规则挑出来。
+//
+// 大小写归一化放在**本函数内**做，而不是交给调用方：它是对外承诺的语义，
+// 两个调用点（ModelFilter.Allows 与测试）都直接依赖它。生产路径虽然已经
+// 在 normalizePatterns/normalizeModelName 里转过小写，但重复一次 ToLower
+// 是常数开销，换来的是"语义自洽"——不依赖调用方是否记得归一化。
+func globMatch(pattern, s string) bool {
+	ok, err := path.Match(strings.ToLower(pattern), strings.ToLower(s))
+	return err == nil && ok
+}
+
+// ValidatePatterns 校验一组 pattern 的语法，返回带下标的错误列表。
+//
+// 供面板在**保存时**就拒绝非法规则（如未闭合的 '['）：存进去才报错的规则
+// 等于静默失效——过滤器永远不匹配，而运维以为限制生效了。
+func ValidatePatterns(pats []string) []error {
+	var errs []error
+	for i, p := range pats {
+		norm := strings.ToLower(strings.TrimSpace(p))
+		if norm == "" {
+			continue
+		}
+		norm = strings.TrimPrefix(norm, "cn:")
+		norm = strings.TrimPrefix(norm, "global:")
+		if _, err := path.Match(norm, ""); err != nil {
+			errs = append(errs, fmt.Errorf("pattern %d (%q): %w", i, p, err))
+		}
+	}
+	return errs
 }
 
 // Clone 深拷贝（不含内部状态，字段都是值类型，直接赋值即可）。
@@ -187,6 +344,19 @@ func Normalize(keys []Key) ([]Key, []error) {
 		if k.CreatedAt.IsZero() {
 			k.CreatedAt = time.Now()
 		}
+		// 模型过滤：保留用户原始 pattern（落盘可读），另编译一份供热路径判定。
+		// 先校验语法：非法 pattern（如未闭合的 '['）会让该条规则**永远不匹配**，
+		// 存进去等于静默失效（运维以为限制生效、实际全放行）。此处直接拒掉整条密钥，
+		// 与其它校验失败同一处理方式（跳过 + 报错），由调用方记 WARN。
+		if patErrs := append(ValidatePatterns(k.AllowModels), ValidatePatterns(k.DenyModels)...); len(patErrs) > 0 {
+			for _, pe := range patErrs {
+				errs = append(errs, fmt.Errorf("api_keys[%d] (%s): %w", i, k.Name, pe))
+			}
+			continue
+		}
+		k.AllowModels = normalizePatterns(k.AllowModels)
+		k.DenyModels = normalizePatterns(k.DenyModels)
+		k.filter = compileFilter(k.AllowModels, k.DenyModels)
 		out = append(out, k)
 	}
 	return out, errs
@@ -275,7 +445,7 @@ func (s *Store) Replace(keys []Key) []error {
 }
 
 // Add 新增一把密钥并返回落定后的条目（含自动生成的 CreateAt）。
-// 密钥值重复返回 ErrDuplicate；realm 非法返回对应错误。
+// 密钥值重复返回 ErrDuplicate；realm 非法 / pattern 语法错误返回对应错误。
 func (s *Store) Add(k Key) (Key, error) {
 	realm, err := NormalizeRealm(k.Realm)
 	if err != nil {
@@ -283,6 +453,10 @@ func (s *Store) Add(k Key) (Key, error) {
 	}
 	if err := ValidateKey(k.Key); err != nil {
 		return Key{}, err
+	}
+	// pattern 语法在写入前就校验：非法规则存进去会永远不匹配（静默失效）。
+	if patErrs := append(ValidatePatterns(k.AllowModels), ValidatePatterns(k.DenyModels)...); len(patErrs) > 0 {
+		return Key{}, errors.Join(patErrs...)
 	}
 	if _, found := s.Lookup(k.Key); found {
 		return Key{}, ErrDuplicate
@@ -295,6 +469,9 @@ func (s *Store) Add(k Key) (Key, error) {
 	if k.CreatedAt.IsZero() {
 		k.CreatedAt = time.Now()
 	}
+	k.AllowModels = normalizePatterns(k.AllowModels)
+	k.DenyModels = normalizePatterns(k.DenyModels)
+	k.filter = compileFilter(k.AllowModels, k.DenyModels)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -306,10 +483,22 @@ func (s *Store) Add(k Key) (Key, error) {
 	return k, nil
 }
 
-// Update 按密钥值定位并改写条目的可变字段（name/realm/disabled/note）。
-// key 本身不可改（它是对外契约）——要换密钥值请 Add 新的再 Remove 旧的。
-// realm 传入指针语义：nil = 不改。
-func (s *Store) Update(token string, name, realm *string, disabled *bool, note *string) (Key, error) {
+// KeyUpdate 一次更新的可变字段集合（nil = 该项不改）。
+//
+// 用结构体而不是继续加位置参数：Update 已从 5 个参数涨到 7 个，位置参数
+// 在调用点会变成一串无法核对的 nil（谁是谁全靠数），且下一个字段又要改签名。
+type KeyUpdate struct {
+	Name        *string
+	Realm       *string
+	Disabled    *bool
+	Note        *string
+	AllowModels *[]string
+	DenyModels  *[]string
+}
+
+// Update 按密钥值定位并改写条目的可变字段。
+// key 本身不可改（它是对外契约）——要换密钥值请用 Rotate。
+func (s *Store) Update(token string, up KeyUpdate) (Key, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snap := s.p.Load()
@@ -320,22 +509,42 @@ func (s *Store) Update(token string, name, realm *string, disabled *bool, note *
 	if !ok {
 		return Key{}, ErrNotFound
 	}
-	if name != nil {
-		cur.Name = strings.TrimSpace(*name)
+	if up.Name != nil {
+		cur.Name = strings.TrimSpace(*up.Name)
 	}
-	if realm != nil {
-		normalized, err := NormalizeRealm(*realm)
+	if up.Realm != nil {
+		normalized, err := NormalizeRealm(*up.Realm)
 		if err != nil {
 			return Key{}, err
 		}
 		cur.Realm = normalized
 	}
-	if disabled != nil {
-		cur.Disabled = *disabled
+	if up.Disabled != nil {
+		cur.Disabled = *up.Disabled
 	}
-	if note != nil {
-		cur.Note = *note
+	if up.Note != nil {
+		cur.Note = *up.Note
 	}
+	// 模型过滤：nil = 不改；指向空切片 = 显式清空（与「不改」区分开，
+	// 否则面板无法把「有规则」改回「不限制」）。
+	// 先校验语法再落定：Update 失败时必须保持条目原样（不能改一半）。
+	if up.AllowModels != nil {
+		if patErrs := ValidatePatterns(*up.AllowModels); len(patErrs) > 0 {
+			return Key{}, errors.Join(patErrs...)
+		}
+	}
+	if up.DenyModels != nil {
+		if patErrs := ValidatePatterns(*up.DenyModels); len(patErrs) > 0 {
+			return Key{}, errors.Join(patErrs...)
+		}
+	}
+	if up.AllowModels != nil {
+		cur.AllowModels = normalizePatterns(*up.AllowModels)
+	}
+	if up.DenyModels != nil {
+		cur.DenyModels = normalizePatterns(*up.DenyModels)
+	}
+	cur.filter = compileFilter(cur.AllowModels, cur.DenyModels)
 	if cur.Name == "" {
 		cur.Name = RealmLabel(cur.Realm) + "密钥"
 	}

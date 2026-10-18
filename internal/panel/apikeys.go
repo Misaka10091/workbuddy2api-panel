@@ -52,14 +52,19 @@ func (p *Panel) apiKeysList(w http.ResponseWriter, r *http.Request) {
 			shown = k.Key
 		}
 		rows = append(rows, map[string]any{
-			"name":        k.Name,
-			"key":         shown,
-			"realm":       k.Realm,
-			"realm_label": apikeys.RealmLabel(k.Realm),
-			"primary":     false,
-			"disabled":    k.Disabled,
-			"note":        k.Note,
-			"created_at":  k.CreatedAt,
+			"name":         k.Name,
+			"key":          shown,
+			"realm":        k.Realm,
+			"realm_label":  apikeys.RealmLabel(k.Realm),
+			"primary":      false,
+			"disabled":     k.Disabled,
+			"note":         k.Note,
+			"created_at":   k.CreatedAt,
+			"allow_models": k.AllowModels,
+			"deny_models":  k.DenyModels,
+			// model_filter 是给前端直接展示的一句话摘要（避免前端再实现一遍
+			// 白/黑名单的语义拼装）；空串 = 不限制。
+			"model_filter": describeFilter(k.AllowModels, k.DenyModels),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -75,17 +80,35 @@ func (p *Panel) apiKeysList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// apiKeyCreate 新建一把密钥：{name, realm, note, key?}。
+// describeFilter 把白/黑名单拼成一句人话（面板列表与确认提示共用）。
+// 空规则返回空串（前端据此显示「不限制」）。
+func describeFilter(allow, deny []string) string {
+	parts := make([]string, 0, 2)
+	if len(allow) > 0 {
+		parts = append(parts, "仅允许 "+strings.Join(allow, ", "))
+	}
+	if len(deny) > 0 {
+		parts = append(parts, "排除 "+strings.Join(deny, ", "))
+	}
+	return strings.Join(parts, "；")
+}
+
+// apiKeyCreate 新建一把密钥：{name, realm, note, key?, allow_models?, deny_models?}。
 // key 留空则服务端生成随机值并**在响应里返回明文一次**（此后只能靠 reveal 再看）。
+//
+// 模型过滤随密钥一起落定：白名单为空 = 不限制；黑名单优先于白名单。
+// 两条列表都支持通配符（* / ?），语义见 apikeys.ModelFilter。
 func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 	if !p.keysWritable(w) {
 		return
 	}
 	var body struct {
-		Name  string `json:"name"`
-		Realm string `json:"realm"`
-		Note  string `json:"note"`
-		Key   string `json:"key"`
+		Name        string   `json:"name"`
+		Realm       string   `json:"realm"`
+		Note        string   `json:"note"`
+		Key         string   `json:"key"`
+		AllowModels []string `json:"allow_models"`
+		DenyModels  []string `json:"deny_models"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
@@ -101,10 +124,12 @@ func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 		key = generated
 	}
 	created, err := p.cfg.APIKeys.Add(apikeys.Key{
-		Name:  body.Name,
-		Key:   key,
-		Realm: body.Realm,
-		Note:  body.Note,
+		Name:        body.Name,
+		Key:         key,
+		Realm:       body.Realm,
+		Note:        body.Note,
+		AllowModels: body.AllowModels,
+		DenyModels:  body.DenyModels,
 	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -116,31 +141,42 @@ func (p *Panel) apiKeyCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("panel: api key 落盘失败（内存已生效，重启会丢）: %v", err)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": true, "key": created.Key, "name": created.Name, "realm": created.Realm,
+			"model_filter": describeFilter(created.AllowModels, created.DenyModels),
 			"persist_error": err.Error(),
 		})
 		return
 	}
-	log.Printf("panel: 新建 API 密钥 name=%q realm=%s（%s）", created.Name, created.Realm, apikeys.Redact(created.Key))
+	log.Printf("panel: 新建 API 密钥 name=%q realm=%s filter=[%s]（%s）",
+		created.Name, created.Realm, describeFilter(created.AllowModels, created.DenyModels), apikeys.Redact(created.Key))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":    true,
 		"key":   created.Key, // 明文只在这里返回一次
 		"name":  created.Name,
 		"realm": created.Realm,
+		"allow_models": created.AllowModels,
+		"deny_models":  created.DenyModels,
+		"model_filter": describeFilter(created.AllowModels, created.DenyModels),
 	})
 }
 
-// apiKeyUpdate 修改一把密钥的可变字段：{key(定位), name?, realm?, disabled?, note?}。
+// apiKeyUpdate 修改一把密钥的可变字段：
+// {key(定位), name?, realm?, disabled?, note?, allow_models?, deny_models?}。
 // key 本身不可改（对外契约）——换值请用 rotate。
+//
+// 模型过滤字段的「不改」与「清空」要区分开：JSON 里字段缺失 = 不改；
+// 显式给 [] = 清空。前端把规则全删光时必须能表达「恢复不限制」。
 func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 	if !p.keysWritable(w) {
 		return
 	}
 	var body struct {
-		Key      string  `json:"key"`
-		Name     *string `json:"name"`
-		Realm    *string `json:"realm"`
-		Disabled *bool   `json:"disabled"`
-		Note     *string `json:"note"`
+		Key         string    `json:"key"`
+		Name        *string   `json:"name"`
+		Realm       *string   `json:"realm"`
+		Disabled    *bool     `json:"disabled"`
+		Note        *string   `json:"note"`
+		AllowModels *[]string `json:"allow_models"`
+		DenyModels  *[]string `json:"deny_models"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body: "+err.Error())
@@ -157,7 +193,14 @@ func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	updated, err := p.cfg.APIKeys.Update(target, body.Name, body.Realm, body.Disabled, body.Note)
+	updated, err := p.cfg.APIKeys.Update(target, apikeys.KeyUpdate{
+		Name:        body.Name,
+		Realm:       body.Realm,
+		Disabled:    body.Disabled,
+		Note:        body.Note,
+		AllowModels: body.AllowModels,
+		DenyModels:  body.DenyModels,
+	})
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -165,9 +208,13 @@ func (p *Panel) apiKeyUpdate(w http.ResponseWriter, r *http.Request) {
 	if err := p.persistKeys(); err != nil {
 		log.Printf("panel: api key 落盘失败: %v", err)
 	}
-	log.Printf("panel: 更新 API 密钥 name=%q realm=%s disabled=%v", updated.Name, updated.Realm, updated.Disabled)
+	log.Printf("panel: 更新 API 密钥 name=%q realm=%s disabled=%v filter=[%s]",
+		updated.Name, updated.Realm, updated.Disabled, describeFilter(updated.AllowModels, updated.DenyModels))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "name": updated.Name, "realm": updated.Realm, "disabled": updated.Disabled,
+		"allow_models": updated.AllowModels,
+		"deny_models":  updated.DenyModels,
+		"model_filter": describeFilter(updated.AllowModels, updated.DenyModels),
 	})
 }
 

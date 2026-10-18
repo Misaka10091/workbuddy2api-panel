@@ -294,7 +294,7 @@ func TestDisabledKeyRejected(t *testing.T) {
 	}), APIKey: "primary-key", APIKeys: store})
 
 	disabled := true
-	if _, err := store.Update(cnKey, nil, nil, &disabled, nil); err != nil {
+	if _, err := store.Update(cnKey, apikeys.KeyUpdate{Disabled: &disabled}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 
