@@ -227,7 +227,19 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header h3 { white-space: nowrap; }
 .box .pad { padding: 17px; }
 
-/* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
+/* 账号表多选：选择列 + 全选复选框 + 选中后的批量操作条。
+   选择列宽 30px，与既有 3px 健康色条（td.mark）并排——两者职责不同：
+   色条用来看状态，复选框用来选账号，不复用同一个单元格。 */
+.acc .pick { width: 30px; min-width: 30px; padding: 0 0 0 10px; }
+.acc .pick input { margin: 0; cursor: pointer; accent-color: var(--accent); }
+.acc tbody tr.sel { background: var(--accent-soft); }
+/* 批量条：选中 0 个时隐藏，避免常驻占位挤掉表头空间。 */
+.batchbar { display: flex; align-items: center; gap: 8px; padding: 9px 17px; border-bottom: 1px solid var(--line-soft); background: var(--accent-soft); }
+.batchbar[hidden] { display: none; }
+.batchbar .cnt { font-size: 12.5px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+.batchbar .grow { flex: 1; }
+
+/* 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
 .tbl-wrap { overflow-x: auto; }
 .acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
 .acc th {
@@ -708,9 +720,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">保活</button>
         </header>
+        <!-- 批量操作条：有选中账号时出现（选中 0 个时 hidden，不占位）。
+             与表头按钮的区别：这里只作用于**勾选的账号**，表头那几个按域跑全池。 -->
+        <div class="batchbar" id="accBatchBar" hidden>
+          <span class="cnt" id="accBatchCount">已选 0 个</span>
+          <button class="xs" data-batch="checkin" title="对勾选的账号签到">签到</button>
+          <button class="xs" data-batch="balance" title="对勾选的账号刷新余额">刷新余额</button>
+          <button class="xs" data-batch="keepalive" title="对勾选的账号续期 token">保活</button>
+          <button class="xs" data-batch="revive" title="清除勾选账号的禁用/冷却/熔断">解冻</button>
+          <button class="xs" data-batch="pause" title="勾选账号退出选号，保号任务照常">暂停选号</button>
+          <button class="xs" data-batch="resume" title="勾选账号恢复参与选号">恢复选号</button>
+          <button class="xs" data-batch="disable" title="勾选账号不再参与选号（需解冻恢复）">禁用</button>
+          <button class="xs danger" data-batch="remove" title="出池并删除 auths/ 下的凭证文件（不可恢复）">移除</button>
+          <span class="grow"></span>
+          <span class="note" id="accBatchMsg"></span>
+          <button class="xs ghost" id="btnAccClearSel">清空选择</button>
+        </div>
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
+            <th class="pick"><input type="checkbox" id="accSelAll" title="全选当前列表" aria-label="全选当前列表"></th>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>

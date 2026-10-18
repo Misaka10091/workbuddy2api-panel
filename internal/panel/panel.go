@@ -12,6 +12,8 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -176,6 +178,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	// 批量操作：对选中的多个账号执行同一动作（见 batch.go）。
+	p.mux.HandleFunc("POST /panel/api/accounts/batch", p.withAuth(p.accountsBatch))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -537,43 +541,94 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	checkinMsg := ""
-	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
-		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
+	res := p.checkinAccount(a)
+	resp := map[string]any{
+		"ok":           res.balanceErr == nil,
+		"checkin_done": res.checkinDone,
 	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
-	if a.IsEnterprise() {
+	if res.enterprise {
 		resp["enterprise"] = true
 	}
-	if checkinMsg != "" {
-		resp["checkin_message"] = checkinMsg
+	if res.note != "" {
+		resp["checkin_message"] = res.note
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
-	if err != nil {
-		resp["balance_error"] = err.Error()
+	if res.balanceErr != nil {
+		// 余额查询失败：签到本身可能已成功，照常回 200 并带 balance_error
+		// （既有行为：签到结果不能被余额查询拖成失败）。
+		resp["ok"] = true
+		resp["balance_error"] = res.balanceErr.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
+	resp["credits"] = res.remain
+	resp["credits_total"] = res.total
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// checkinOutcome 单账号签到的完整结果（单号接口与批量接口共用同一份实现）。
+//
+// 用结构体而不是多返回值：签到要同时带回「业务提示 / 是否已签 / 是否企业版 /
+// 余额错误 / 余额数值」五项，位置返回会让调用点变成一串无法核对的 nil。
+type checkinOutcome struct {
+	note        string // 业务提示（"今天已签到" / "企业版无签到体系"…）
+	checkinDone bool
+	enterprise  bool
+	balanceErr  error
+	remain      int64
+	total       int64
+}
+
+// checkinAccount 单账号签到 + 余额刷新。
+//
+// 业务错误（"今天已签到"等）不算失败——它们进 note，余额查询照跑；
+// 只有余额查询失败才让 balanceErr 非空（此时签到可能已经成功）。
+func (p *Panel) checkinAccount(a *auth.Auth) checkinOutcome {
+	var out checkinOutcome
+	uid := a.UID
+	out.enterprise = a.IsEnterprise()
+	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
+	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
+	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
+	if out.enterprise {
+		out.note = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		out.note = err.Error() // "今天已签到"等业务错误照常查余额
+		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
+		if upstream.IsAlreadyCheckin(err) {
+			p.cfg.Pool.NoteCheckinDone(uid)
+			out.checkinDone = true
+		}
+	} else {
+		p.cfg.Pool.NoteCheckinDone(uid)
+		out.checkinDone = true
+	}
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	if err != nil {
+		out.balanceErr = err
+		return out
+	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
-	writeJSON(w, http.StatusOK, resp)
+	out.remain, out.total = remain, total
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, out.note, remain, total)
+	return out
+}
+
+// checkinOne 批量入口：按 uid 签到，返回给人看的提示。
+func (p *Panel) checkinOne(uid string) (string, error) {
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return "", fmt.Errorf("account not found")
+	}
+	out := p.checkinAccount(a)
+	if out.balanceErr != nil {
+		// 签到可能已成功、只是余额查询失败：把这点说清楚，别让人以为整步失败。
+		if out.note != "" {
+			return "", fmt.Errorf("%s（余额查询失败: %v）", out.note, out.balanceErr)
+		}
+		return "", fmt.Errorf("余额查询失败: %w", out.balanceErr)
+	}
+	return out.note, nil
 }
 
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
@@ -584,13 +639,66 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	remain, total, err := p.balanceAccount(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+}
+
+// balanceAccount 单账号余额刷新（单号与批量共用）。返回剩余/总额。
+func (p *Panel) balanceAccount(a *auth.Auth) (remain, total int64, err error) {
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	if err != nil {
+		return 0, 0, err
+	}
+	p.cfg.Pool.SetCreditsDetailed(a.UID, remain, total, expiring, earliestAt, earliestRemaining)
+	return remain, total, nil
+}
+
+// balanceOne 批量入口：按 uid 刷新余额，返回给人看的提示。
+func (p *Panel) balanceOne(uid string) (string, error) {
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return "", fmt.Errorf("account not found")
+	}
+	remain, total, err := p.balanceAccount(a)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d/%d", remain, total), nil
+}
+
+// keepaliveOne 批量入口：按 uid 续期 token。
+//
+// 与调度器 RunKeepaliveNow 的单号语义严格一致（见 scheduler.go 的 keepalive 段）：
+// 12153 session dead 走池的**连续计数**（NoteSessionDead），达阈值才禁用——
+// 单次失败不禁号（历史上 13 个 disabled 号全是这个逻辑缺失导致的误判）。
+func (p *Panel) keepaliveOne(uid string) (string, error) {
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return "", fmt.Errorf("account not found")
+	}
+	if a.RefreshTokenValue() == "" {
+		return "", fmt.Errorf("no refresh token")
+	}
+	if err := p.cfg.Upstream.RefreshToken(a); err != nil {
+		var ue *upstream.Error
+		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			if p.cfg.Pool.NoteSessionDead(uid) {
+				return "", fmt.Errorf("session 已失效且连续 %d 次刷新失败 → 已禁用",
+					pool.SessionDeadThreshold())
+			}
+			return "", fmt.Errorf("session 已失效（%v）", err)
+		}
+		return "", err
+	}
+	p.cfg.Pool.ClearSessionDead(uid) // 刷新成功清误判计数，失败不该累计
+	if err := a.SaveAtomic(); err != nil {
+		return "", fmt.Errorf("token 已续期但落盘失败: %w", err)
+	}
+	return "", nil
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
@@ -603,7 +711,7 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	fileMsg := ""
 	if a.FilePath != "" {
-		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
+		if err := removeFile(a.FilePath); err != nil {
 			fileMsg = err.Error()
 		}
 	}
@@ -614,6 +722,15 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// removeFile 删除凭证文件；文件本就不存在视为成功（幂等）。
+// 单独成函数是为了让单号与批量移除共用同一份「不存在不算错」的判断。
+func removeFile(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

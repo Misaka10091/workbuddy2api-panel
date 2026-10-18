@@ -456,6 +456,50 @@ function setAccRealm(realm) {
   syncBatchButtonLabels();
 }
 
+// accSel 账号表的多选集合（uid → true）。
+//
+// 用 Set 而不是数组：勾选/取消/判断是否选中都是 O(1)，且天然去重。
+// 每轮 overview 刷新后要**按当前列表裁剪**（见 pruneAccSel）：账号被移除、
+// 或切到另一域筛选后，陈旧 uid 留在集合里会让批量条显示"已选 3 个"却
+// 在可见列表里一个都勾不上——那种状态最容易误操作。
+let accSel = new Set();
+
+// short8 uid 的短标识（错误明细里用，完整 UUID 会把一行撑爆）。
+function short8(uid) {
+  const s = String(uid || '');
+  return s.length > 8 ? s.slice(0, 8) : s;
+}
+
+function pruneAccSel(list) {
+  const alive = new Set((list || []).map(s => s.uid));
+  for (const uid of [...accSel]) {
+    if (!alive.has(uid)) accSel.delete(uid);
+  }
+}
+
+// accSelVisible 当前**可见**（受域筛选影响）列表里的选中项。
+// 批量操作只作用于可见的选中账号：用户看不到的号不该被"顺手"操作。
+function accSelVisible(shown) {
+  return (shown || []).filter(s => accSel.has(s.uid)).map(s => s.uid);
+}
+
+// syncBatchBar 刷新批量操作条的可见性与计数。
+function syncBatchBar(shown) {
+  const bar = $('accBatchBar');
+  if (!bar) return;
+  const n = accSelVisible(shown).length;
+  bar.hidden = n === 0;
+  if ($('accBatchCount')) $('accBatchCount').textContent = '已选 ' + n + ' 个';
+  // 全选框三态：全选 / 未选 / 部分选（indeterminate）。
+  const all = $('accSelAll');
+  if (all) {
+    const total = (shown || []).length;
+    all.checked = n > 0 && n === total;
+    all.indeterminate = n > 0 && n < total;
+    all.disabled = total === 0;
+  }
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   // 域计数徽标（switch 里的数字）用**全量**账号算，不受当前筛选影响：
@@ -467,13 +511,16 @@ function renderAccounts(list) {
   if (nCn) nCn.textContent = counts.cn;
   if (nGl) nGl.textContent = counts.global;
 
+  // 选择集合按当前全量列表裁剪（见 accSel 注释），再算可见选中。
+  pruneAccSel(list);
   const shown = accFiltered(list || []);
   if (!shown.length) {
     // 空池 vs 该域没有账号要说清：后者是筛选结果，不是「池子空了」。
     tb.innerHTML = (list || []).length
-      ? '<tr><td colspan="9"><div class="empty"><div class="big">' + realmLabel(accRealm) + '暂无账号</div>' +
+      ? '<tr><td colspan="10"><div class="empty"><div class="big">' + realmLabel(accRealm) + '暂无账号</div>' +
         '该域没有账号，切到「全部」或在「添加账号」里选' + realmLabel(accRealm) + '</div></td></tr>'
-      : '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+      : '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    syncBatchBar(shown);
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -525,7 +572,11 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+    const sel = accSel.has(s.uid);
+    // 选中行加 .sel 底色：多选时"哪几行被选中"必须一眼可见，不能只靠复选框。
+    return '<tr class="' + cls + (sel ? ' sel' : '') + '" title="uid: ' + esc(s.uid) + '">' +
+      '<td class="pick"><input type="checkbox" data-pick="' + esc(s.uid) + '"' + (sel ? ' checked' : '') +
+        ' aria-label="选择 ' + esc(s.nickname || s.uid) + '"></td>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + ' <span class="realm-tag">' + realmLabel(s.realm || 'cn') + '</span>' + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
@@ -555,6 +606,7 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+  syncBatchBar(shown);
 }
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
@@ -711,6 +763,119 @@ $('accBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 });
+
+/* ── 账号多选批量操作 ─────────────────────────────────────────────── */
+/* 交互约定：
+   - 每行首列复选框；表头复选框管「当前可见列表」的全选/全不选（三态）；
+   - 批量条只在有选中时出现，按钮直接执行（危险动作二次确认）；
+   - 只对**可见**的选中账号生效——被域筛选藏起来的号不该被顺手操作。 */
+
+// 行复选框：change 而不是 click（键盘空格也能触发，且语义是"状态改变"）。
+$('accBody').addEventListener('change', ev => {
+  const cb = ev.target.closest('input[data-pick]');
+  if (!cb) return;
+  const uid = cb.dataset.pick;
+  if (cb.checked) accSel.add(uid); else accSel.delete(uid);
+  // 只更新该行底色与批量条，不整表重渲染（重渲染会丢焦点，连续勾选很难受）。
+  const tr = cb.closest('tr');
+  if (tr) tr.classList.toggle('sel', cb.checked);
+  syncBatchBar(accFiltered((overviewData && overviewData.accounts) || []));
+});
+
+// 表头全选：作用于当前可见列表。
+if ($('accSelAll')) {
+  $('accSelAll').addEventListener('change', ev => {
+    const shown = accFiltered((overviewData && overviewData.accounts) || []);
+    if (ev.target.checked) {
+      for (const s of shown) accSel.add(s.uid);
+    } else {
+      for (const s of shown) accSel.delete(s.uid);
+    }
+    renderAccounts((overviewData && overviewData.accounts) || []);
+  });
+}
+
+if ($('btnAccClearSel')) {
+  $('btnAccClearSel').onclick = () => {
+    accSel.clear();
+    renderAccounts((overviewData && overviewData.accounts) || []);
+  };
+}
+
+// 批量动作的中文名与危险等级（危险动作要二次确认）。
+const BATCH_META = {
+  checkin:   { label: '签到',     danger: false },
+  balance:   { label: '刷新余额', danger: false },
+  keepalive: { label: '保活',     danger: false },
+  revive:    { label: '解冻',     danger: false },
+  pause:     { label: '暂停选号', danger: false },
+  resume:    { label: '恢复选号', danger: false },
+  disable:   { label: '禁用',     danger: true },
+  remove:    { label: '移除',     danger: true },
+};
+
+// runAccountBatch 对选中的账号执行一个动作，并把结果如实汇报。
+//
+// 部分失败如实展示：后端逐账号返回 results，这里统计成功/失败并把失败原因
+// 列在批量条上（而不是只弹一句"完成"）——批量操作最怕"看起来成功"。
+async function runAccountBatch(action) {
+  const shown = accFiltered((overviewData && overviewData.accounts) || []);
+  const uids = accSelVisible(shown);
+  if (!uids.length) return;
+  const meta = BATCH_META[action] || { label: action, danger: false };
+
+  if (meta.danger) {
+    const extra = action === 'remove'
+      ? '\n\n移除会同时删除 auths/ 下的凭证文件，不可恢复。'
+      : '';
+    if (!confirm('对选中的 ' + uids.length + ' 个账号执行「' + meta.label + '」？' + extra)) return;
+  }
+
+  const msg = $('accBatchMsg');
+  if (msg) msg.textContent = '正在' + meta.label + '…（' + uids.length + ' 个）';
+  // 批量条按钮全部临时禁用，防重复点击（签到/保活会真的打上游）。
+  const btns = [...document.querySelectorAll('#accBatchBar button[data-batch]')];
+  btns.forEach(b => { b.disabled = true; });
+
+  try {
+    const r = await api('accounts/batch', {
+      method: 'POST',
+      body: JSON.stringify({ action, uids }),
+    });
+    const failed = r.failed || 0;
+    if (failed) {
+      // 失败明细进批量条（比 toast 更持久，能逐条看）。
+      const rows = (r.results || []).filter(x => !x.ok && x.error);
+      const detail = rows.slice(0, 5).map(x =>
+        short8(x.uid) + '：' + x.error).join('；');
+      const more = rows.length > 5 ? ' …另有 ' + (rows.length - 5) + ' 个失败' : '';
+      if (msg) msg.textContent = meta.label + '：' + r.succeeded + ' 成功 / ' + failed + ' 失败 — ' + detail + more;
+      toast(meta.label + '：' + r.succeeded + ' 成功 / ' + failed + ' 失败', 'err');
+    } else {
+      if (msg) msg.textContent = meta.label + '：' + r.succeeded + ' 个全部成功';
+      toast(meta.label + '完成（' + r.succeeded + ' 个）', 'ok');
+    }
+    // 移除后这些 uid 已不存在，从选择集里剔掉（否则批量条会显示已选但一行都不在）。
+    if (action === 'remove') {
+      for (const u of uids) accSel.delete(u);
+    }
+    // 成功项从选中集移除？否——运维常要"勾几个、逐个动作来一遍"，保留选择更顺手。
+  } catch (e) {
+    if (msg) msg.textContent = meta.label + '失败：' + e.message;
+    toast(e.message, 'err');
+  } finally {
+    btns.forEach(b => { b.disabled = false; });
+    loadOverview(true);
+  }
+}
+
+if ($('accBatchBar')) {
+  $('accBatchBar').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-batch]');
+    if (!b || b.disabled) return;
+    runAccountBatch(b.dataset.batch);
+  });
+}
 
 /* 表头批量按钮：作用域跟随当前域筛选（「全部」时不带参数 = 全池，与历史行为一致）。
    按钮文案也随域刷新——让「当前这批按钮只动哪一域」在点击前就看得见。 */
