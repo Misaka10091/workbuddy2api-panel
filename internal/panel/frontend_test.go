@@ -1006,3 +1006,133 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
+
+// TestAppJSClipboardInsecureContext 钉住「非 https 面板复制无效」。
+//
+// navigator.clipboard 只在 secure context（https / localhost / file）存在。面板的典型
+// 部署是反代到内网 http://<IP>:<PORT>，那里 navigator.clipboard 是 undefined，旧代码
+// 直接调 writeText 抛 TypeError：按钮点了没反应、也没有 toast，属于静默失效。
+//
+// 用例两层：
+//  1. 静态：navigator.clipboard 只允许出现在 copyText 里——任何绕过它的复制调用都算 bug；
+//  2. 运行时（node + DOM 桩）：非 secure 走 execCommand；secure 优先 clipboard；
+//     secure 下 clipboard 被权限策略拒绝（Promise reject）时仍能降级成功。
+func TestAppJSClipboardInsecureContext(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	copyStart := strings.Index(js, "function copyText")
+	if copyStart < 0 {
+		t.Fatal("app.js 缺 copyText（统一复制入口）")
+	}
+	rel := strings.Index(js[copyStart:], "\nfunction ")
+	if rel < 0 {
+		t.Fatal("copyText 之后找不到下一个顶层函数，切片边界不可信")
+	}
+	copyEnd := copyStart + rel
+
+	// 静态检查：逐个定位 navigator.clipboard，跳过纯注释行，其余必须落在 copyText 内。
+	for i := 0; ; {
+		j := strings.Index(js[i:], "navigator.clipboard")
+		if j < 0 {
+			break
+		}
+		at := i + j
+		lineStart := strings.LastIndex(js[:at], "\n") + 1
+		lineEnd := strings.Index(js[at:], "\n")
+		if lineEnd < 0 {
+			lineEnd = len(js) - at
+		}
+		trimmed := strings.TrimSpace(js[lineStart : at+lineEnd])
+		// 注释里的提及不算违规：整行注释，或落在 /* */ 块内（最后一个 /* 晚于最后一个 */）。
+		blockOpen := strings.LastIndex(js[:at], "/*")
+		blockClose := strings.LastIndex(js[:at], "*/")
+		inBlockComment := blockOpen >= 0 && blockOpen > blockClose
+		isComment := inBlockComment || strings.HasPrefix(trimmed, "//") ||
+			strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*")
+		if !isComment && (at < copyStart || at >= copyEnd) {
+			t.Errorf("app.js:%d 直接用了 navigator.clipboard（非 secure context 下静默失效），必须改走 copyText：%s",
+				strings.Count(js[:at], "\n")+1, trimmed)
+		}
+		i = at + 1
+	}
+
+	if t.Failed() {
+		return // 静态检查已失败：此处 return 而不是 Skip，避免把 FAIL 盖成 SKIP
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; clipboard runtime cases skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function copyText');
+let end = src.indexOf('\nfunction ', start);
+if (start < 0 || end < 0) throw new Error('copyText not found');
+const body = src.slice(start, end) + '\nthis.copyText = copyText;';
+
+function run(secure, clipboard, execOk) {
+  const log = { clipboard: 0, exec: 0, text: null };
+  const ctx = {
+    Promise: Promise,
+    Error: Error,
+    window: { isSecureContext: secure },
+    navigator: {},
+    document: {
+      createElement: function () {
+        return {
+          value: '', style: {},
+          setAttribute: function () {}, select: function () {},
+          setSelectionRange: function () {}, remove: function () {},
+        };
+      },
+      body: { appendChild: function (ta) { log.text = ta.value; } },
+      execCommand: function () { log.exec++; return execOk; },
+    },
+  };
+  if (clipboard === 'ok') {
+    ctx.navigator.clipboard = { writeText: function (t) { log.clipboard++; log.text = t; return Promise.resolve(); } };
+  } else if (clipboard === 'reject') {
+    ctx.navigator.clipboard = { writeText: function () { log.clipboard++; return Promise.reject(new Error('denied')); } };
+  }
+  vm.createContext(ctx);
+  vm.runInContext(body, ctx);
+  return ctx.copyText('SECRET').then(
+    function () { return { ok: true, err: '', clipboard: log.clipboard, exec: log.exec, text: log.text }; },
+    function (e) { return { ok: false, err: String(e && e.message), clipboard: log.clipboard, exec: log.exec, text: log.text }; }
+  );
+}
+
+(async function () {
+  const out = {
+    insecure: await run(false, 'none', true),
+    insecureExecFails: await run(false, 'none', false),
+    secureClipboard: await run(true, 'ok', true),
+    secureClipboardRejected: await run(true, 'reject', true),
+  };
+  process.stdout.write(JSON.stringify(out));
+})().catch(function (e) { console.error(e && e.stack || e); process.exit(1); });`
+	f, err := os.CreateTemp(t.TempDir(), "clipboard-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("clipboard fallback node test failed: %v\n%s", err, out)
+	}
+	const want = `{"insecure":{"ok":true,"err":"","clipboard":0,"exec":1,"text":"SECRET"},` +
+		`"insecureExecFails":{"ok":false,"err":"copy failed","clipboard":0,"exec":1,"text":"SECRET"},` +
+		`"secureClipboard":{"ok":true,"err":"","clipboard":1,"exec":0,"text":"SECRET"},` +
+		`"secureClipboardRejected":{"ok":true,"err":"","clipboard":1,"exec":1,"text":"SECRET"}}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("clipboard fallback=%s\nwant %s（insecure 必须走 execCommand；secure 拒绝后必须降级）",
+			strings.TrimSpace(string(out)), want)
+	}
+}

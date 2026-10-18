@@ -77,6 +77,38 @@ function ago(iso) {
   if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
   return Math.floor(s / 86400) + ' 天前';
 }
+// copyText 统一复制入口——面板里所有「复制」都必须走它。
+//
+// navigator.clipboard 只在 secure context（https / localhost / file://）存在。面板的
+// 典型部署是反代到内网 http://<IP>:<PORT>，那里 navigator.clipboard 是 undefined，
+// 直接调 writeText 抛 TypeError，表现为「按钮点了没反应、也不报错」——静默失效。
+// 所以：
+//   1) 先判 window.isSecureContext，非 secure 直接走 execCommand；
+//   2) secure 下 writeText 仍可能被权限策略/iframe 拒绝（Promise reject），兜底再降级；
+//   3) execCommand 要求用户手势内同步调用，故降级分支不做任何 await。
+// 一律返回 Promise，调用方按 then/catch 处理即可。
+function copyText(text) {
+  const legacyCopy = () => new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    // 固定定位 + 透明：避免插入/选中时页面滚动跳动。
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0';
+    document.body.appendChild(ta);
+    let ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length); // iOS 上 select() 不够
+      ok = document.execCommand('copy');
+    } catch (e) { ok = false; }
+    ta.remove();
+    ok ? resolve() : reject(new Error('copy failed'));
+  });
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try { return navigator.clipboard.writeText(text).catch(legacyCopy); } catch (e) { /* 落到降级 */ }
+  }
+  return legacyCopy();
+}
 function dur(sec) {
   sec = Math.max(0, Math.round(sec));
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -1109,7 +1141,7 @@ function akShowCreated(name, realm, key, filterDesc) {
   if ($('akDoneMeta')) $('akDoneMeta').textContent = meta.join(' · ');
   if ($('akDoneKey')) $('akDoneKey').textContent = key;
   $('akDoneVeil').classList.add('on');
-  if (navigator.clipboard) navigator.clipboard.writeText(key).catch(() => {});
+  copyText(key).catch(() => {}); // 顺手复制；失败不打扰（明文仍在弹框里）
 }
 
 // akFilterCell 列表里的「可用模型」列：显示后端给的一句话摘要或「不限制」。
@@ -1183,7 +1215,7 @@ if ($('btnAkDoneClose')) $('btnAkDoneClose').onclick = () => $('akDoneVeil').cla
 if ($('btnAkDoneCopy')) {
   $('btnAkDoneCopy').onclick = () => {
     const k = $('akDoneKey').textContent;
-    navigator.clipboard.writeText(k).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
+    copyText(k).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
   };
 }
 // 规则输入变化即刷新预览（三条输入都接）。
@@ -1283,7 +1315,7 @@ if ($('akBody')) {
     if (act === 'remove' && !confirm('删除后使用该密钥的客户端会立即 401，且不可恢复。确认删除？')) return;
     if (act === 'rotate' && !confirm('轮换会立即废弃旧密钥值，使用旧值的客户端会 401。确认轮换？')) return;
     if (act === 'copy') {
-      navigator.clipboard.writeText(key).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
+      copyText(key).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
       return;
     }
     if (act === 'filter') {
@@ -1920,7 +1952,7 @@ function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remo
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
-$('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
+$('btnCopyUrl').onclick = () => copyText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
   const file = $('importFile').files[0];
@@ -2322,22 +2354,6 @@ function qrSVG(M, px) {
 }
 
 /* ── 开学季券码查询（弹窗，仿活动页 #/prizes?tab=vouchers）──────────── */
-/* copyText：clipboard API 只在 secure context（https/localhost）可用，
-   远程 http 面板会拿不到 navigator.clipboard → 降级 execCommand。 */
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
-  return new Promise((resolve, reject) => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.cssText = 'position:fixed;opacity:0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy') ? resolve() : reject(new Error('copy failed')); }
-    catch (e) { reject(e); }
-    finally { ta.remove(); }
-  });
-}
-
 function vcCard(v) {
   const expired = v.valid_to && new Date(v.valid_to) < new Date();
   return '<div class="vc' + (expired ? ' expired' : '') + '">' +
