@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
@@ -166,6 +167,17 @@ type Config struct {
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
+
+	// APIKeys 多密钥表（每个密钥可绑定国内版 / 国际版）。
+	//
+	// 与顶层 api_key 的关系：
+	//   - api_key 始终保留为「不限域主密钥」（面板鉴权 + 跨域运维用），老部署零迁移；
+	//   - 这里的每条密钥是给**下游客户端**用的，可绑定单一域（cn/global）或留空不限；
+	//   - 密钥表为空时行为与历史完全一致（只有主密钥、模型前缀决定域）。
+	//
+	// 落盘形态就是明文（与 api_key 同风格——config 本就是敏感文件）；面板列表默认
+	// 回显脱敏值，需要明文时逐条显式触发。
+	APIKeys []apikeys.Key `json:"api_keys,omitempty"`
 
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host

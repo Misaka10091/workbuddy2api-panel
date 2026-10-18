@@ -191,6 +191,29 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
 
+/* 账号池「国内版 / 国际版分开管理」的域切换条 + 域卡片。
+   域切换只影响展示与批量按钮的作用域（后端 ?realm= 参数），不改选号语义。 */
+.realm-switch { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; }
+.realm-switch button { border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); padding: 4px 12px; border-radius: 7px; cursor: pointer; }
+.realm-switch button:hover:not(.on) { color: var(--ink); border-color: transparent; }
+.realm-switch button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.realm-switch button .n { color: var(--ink-3); font-family: var(--mono); margin-left: 5px; }
+.realm-switch button.on .n { color: var(--accent); }
+
+/* 域卡片：两域并排时一眼对比「各域几个号、几个可用、多少积分」。 */
+.realm-cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 20px; }
+@media (max-width: 760px) { .realm-cards { grid-template-columns: 1fr; } }
+.realm-card { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); padding: 14px 17px; }
+.realm-card.on { border-color: var(--accent); }
+.realm-card h4 { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.realm-card h4 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
+.realm-card h4 .dot.ok { background: var(--ok); } .realm-card h4 .dot.warn { background: var(--warn); } .realm-card h4 .dot.bad { background: var(--bad); }
+.realm-card .kv { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; }
+.realm-card .kv .v { font: 600 19px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.realm-card .kv .k { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+.realm-card .kv .v.good { color: var(--ok); } .realm-card .kv .v.warn { color: var(--warn); } .realm-card .kv .v.bad { color: var(--bad); }
+.realm-card .acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
 .box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
@@ -611,6 +634,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#apikeys" data-view="apikeys">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5" cy="8" r="2.6"/><path d="M7.6 8H14M11.5 8v2.2M13.2 8v1.6"/></svg>
+        API 密钥</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -639,6 +665,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts">
+      <!-- 域卡片：国内版 / 国际版各自的账号数与积分，点卡片即按该域筛选下方账号池。
+           数据来自 /panel/api/overview 的 realm_counts（一次遍历算完，不额外打上游）。 -->
+      <div class="realm-cards" id="realmCards"></div>
+
       <div class="stats">
         <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
@@ -665,12 +695,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header>
           <h3>账号池</h3>
+          <span class="realm-switch" id="accRealmSwitch" role="tablist" aria-label="按域筛选账号池">
+            <button type="button" data-realm="" class="on" role="tab" aria-selected="true">全部<span class="n" id="accRealmAllN">0</span></button>
+            <button type="button" data-realm="cn" role="tab" aria-selected="false">国内版<span class="n" id="accRealmCnN">0</span></button>
+            <button type="button" data-realm="global" role="tab" aria-selected="false">国际版<span class="n" id="accRealmGlN">0</span></button>
+          </span>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
-          <button class="xs" id="btnCheckinAll">全部签到</button>
+          <!-- 批量按钮走当前选中的域作用域（?realm=），「全部」时不带参数（= 全池，与历史行为一致）。 -->
+          <button class="xs" id="btnCheckinAll">签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
-          <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <button class="xs" id="btnKeepaliveAll">保活</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
@@ -887,6 +923,57 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <table class="acc zebra">
             <thead id="usCreditHead"></thead>
             <tbody id="usCreditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- API 密钥（多密钥，每把可绑定国内版 / 国际版） -->
+    <section class="view" id="view-apikeys" hidden>
+      <div class="box">
+        <header>
+          <h3>新建密钥 <span class="hint">每把密钥绑定一个域：用它调的请求只会落到该域账号上</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="akNote"></span>
+        </header>
+        <div class="pad">
+          <div class="grid3">
+            <label class="fld"><span class="lb">名称（备注用）</span>
+              <input id="akName" placeholder="例如：给团队 A 的国内版">
+              <span class="hint">仅用于识别，可重复</span></label>
+            <label class="fld"><span class="lb">绑定版本</span>
+              <select id="akRealm">
+                <option value="cn">国内版（CN）</option>
+                <option value="global">国际版（Global）</option>
+                <option value="">不限域（可调两域，需用 cn:/global: 前缀区分）</option>
+              </select>
+              <span class="hint">国内版密钥只能调 CN 账号，国际版只能调 Global 账号</span></label>
+            <label class="fld"><span class="lb">密钥值（留空自动生成）</span>
+              <input id="akKey" placeholder="留空 = 服务端随机生成">
+              <span class="hint">自定义至少 8 位、不含空白</span></label>
+          </div>
+          <div class="hint" style="margin-bottom:10px">绑定版本是强约束：国际版密钥用裸模型名（如 <code>hy3</code>）也只会落到国际版账号；
+            若显式写了相反的域前缀（如国际版密钥调 <code>cn:hy3</code>）会直接 400，不会静默改域烧错积分。</div>
+          <button class="primary" id="btnAkCreate">创建密钥</button>
+          <span class="note" id="akCreateMsg" style="margin-left:10px"></span>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>密钥列表</h3>
+          <span class="grow"></span>
+          <span class="note" id="akListNote">—</span>
+          <button class="xs" id="btnAkReveal">显示明文</button>
+          <button class="xs" id="btnAkReload">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>名称</th><th>密钥</th><th>绑定版本</th><th>状态</th><th>备注</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="akBody"></tbody>
           </table>
         </div>
       </div>

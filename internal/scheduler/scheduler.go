@@ -406,7 +406,7 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			case taskTravel:
 				s.RunTravelNow()
 			case taskActivity:
-				s.runActivity(ctx)
+				s.runActivity(ctx, "")
 			case taskKeepalive:
 				s.RunKeepaliveNow()
 			case taskBlackcat:
@@ -447,7 +447,18 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNow() {
+//
+// 等价于 RunCheckinRealm("")（全池，既有行为）。
+func (s *Scheduler) RunCheckinNow() { s.RunCheckinRealm("") }
+
+// RunCheckinRealm 签到 + 余额刷新 + 解冻，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunCheckinNow 的现状语义）。
+//
+// 域过滤是**附加谓词**，不改任何既有门控：global 账号仍然因「无 CN 签到体系」
+// 被跳过（此谓词与域作用域无关，见下方 D4 门控），企业版仍然跳过签到但照常
+// 查额度。作用域只决定「遍历哪些账号」。
+func (s *Scheduler) RunCheckinRealm(realm string) {
+	realm = normalizeRealm(realm)
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -456,6 +467,9 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
@@ -494,7 +508,9 @@ func (s *Scheduler) RunCheckinNow() {
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
-	s.RunStreakBonusNow()
+	// 连登管家跟随同一域作用域：只给国际版签到时，不该顺带把国内版的
+	// 兑换/抽奖也跑一遍（那是另一域的账号，运维明确没要求动它）。
+	s.RunStreakBonusRealm(realm)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -506,12 +522,19 @@ func (s *Scheduler) RunCheckinNow() {
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
+// 等价于 RunActivityRealm("")（全池，既有行为）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), "")
 }
 
-// runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+// RunActivityRealm 活跃上报，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池。同步执行（面板批量按钮等它跑完再回报）。
+func (s *Scheduler) RunActivityRealm(realm string) {
+	s.runActivity(context.Background(), normalizeRealm(realm))
+}
+
+// runActivity 活跃上报遍历，随 ctx 取消立即退出；realm 为域作用域（""=全池）。
+func (s *Scheduler) runActivity(ctx context.Context, realm string) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -520,6 +543,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
@@ -577,7 +603,13 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
-func (s *Scheduler) RunKeepaliveNow() {
+// 等价于 RunKeepaliveRealm("")（全池，既有行为）。
+func (s *Scheduler) RunKeepaliveNow() { s.RunKeepaliveRealm("") }
+
+// RunKeepaliveRealm token 保活，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunKeepaliveNow 的现状语义）。
+func (s *Scheduler) RunKeepaliveRealm(realm string) {
+	realm = normalizeRealm(realm)
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -585,6 +617,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -611,7 +646,13 @@ func (s *Scheduler) RunKeepaliveNow() {
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
-func (s *Scheduler) RunBalanceRefreshNow() {
+// 等价于 RunBalanceRefreshRealm("")（全池，既有行为）。
+func (s *Scheduler) RunBalanceRefreshNow() { s.RunBalanceRefreshRealm("") }
+
+// RunBalanceRefreshRealm 余额刷新，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunBalanceRefreshNow 的现状语义）。
+func (s *Scheduler) RunBalanceRefreshRealm(realm string) {
+	realm = normalizeRealm(realm)
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
@@ -621,6 +662,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		wg.Add(1)

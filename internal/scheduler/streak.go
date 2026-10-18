@@ -17,13 +17,23 @@ import (
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
-func (s *Scheduler) RunStreakBonusNow() {
+// 等价于 RunStreakBonusRealm("")（全池，既有行为）。
+func (s *Scheduler) RunStreakBonusNow() { s.RunStreakBonusRealm("") }
+
+// RunStreakBonusRealm 连登兑换 + 抽奖，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunStreakBonusNow 的现状语义）。
+// 由 RunCheckinRealm 按其域作用域转调——「只给某域签到」不该顺带跑另一域的兑换。
+func (s *Scheduler) RunStreakBonusRealm(realm string) {
+	realm = normalizeRealm(realm)
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		if a.IsGlobal() {

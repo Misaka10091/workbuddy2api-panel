@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -74,6 +75,15 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// APIKeys 多密钥表（可选；nil 或空表 = 只用 APIKey 单密钥，历史行为）。
+	//
+	// 每把密钥可绑定账号域（cn/global/""=不限，见 apikeys包）。绑定后：
+	//   - 裸模型名（无 realm 前缀）按密钥的域选号，而不是固定回落 cn；
+	//   - 显式写了**相反**域的前缀直接 400（不静默改域，见 chatCompletions）；
+	//   - /v1/models 只列该域的模型（客户端看到什么就能调什么，不必记前缀）。
+	// APIKey（config.api_key）始终保留为「不限域主密钥」：老部署零迁移。
+	APIKeys *apikeys.Store
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -168,14 +178,105 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// keyScope 一次鉴权的产物：这把密钥被允许用哪个域（"" = 不限）。
+// 放在请求上下文里，供 chatCompletions / models 读取域约束。
+type keyScope struct {
+	// Realm 密钥绑定的域（""=不限）。
+	Realm string
+	// Name 密钥标签（便于日志区分是谁在调；主密钥为空）。
+	Name string
+	// Primary 是否为 config.api_key 主密钥（不限域；日志用）。
+	Primary bool
+	// KeyID 密钥值本身（只用于在请求日志里做**脱敏后的**标识，勿直接打印）。
+	KeyID string
+}
+
+type keyScopeKey struct{}
+
+// scopeFrom 取请求的密钥作用域；无（未启用多密钥且无主密钥）时返回不限域。
+func scopeFrom(r *http.Request) keyScope {
+	if v, ok := r.Context().Value(keyScopeKey{}).(keyScope); ok {
+		return v
+	}
+	return keyScope{}
+}
+
+// withAuth Bearer 鉴权：先按 config.api_key（主密钥，不限域）比对，再查多密钥表。
+//
+// 为什么主密钥保留优先：老部署只有 config.api_key，行为必须逐字不变；且主密钥
+// 天然是「运维全权」——不该被强制绑定某个域（面板/探活/跨域排障都用它）。
+//
+// 三态失败语义（都对客户端 401，但日志区分，便于运维自查）：
+//   - 未提供 / 与主密钥和任何密钥表条目都不匹配 → invalid_api_key
+//   - 命中密钥表但该条目已停用              → api_key_disabled
+//
+// 鉴权通过时把 keyScope 塞进 context，chat/models 据此收敛域。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		scope, ok, disabled := h.authenticate(r)
+		if !ok {
+			code := "invalid_api_key"
+			msg := "missing or invalid API key"
+			if disabled {
+				code = "api_key_disabled"
+				msg = "this API key has been disabled"
+			}
+			writeOpenAIError(w, http.StatusUnauthorized, code, msg)
 			return
+		}
+		if scope.Realm != "" || scope.Name != "" {
+			r = r.WithContext(context.WithValue(r.Context(), keyScopeKey{}, scope))
 		}
 		next(w, r)
 	}
+}
+
+// authenticate 执行鉴权并返回该密钥的作用域。
+// 返回 (scope, ok, disabled)：disabled=true 表示「密钥存在但被停用」。
+func (h *Handler) authenticate(r *http.Request) (keyScope, bool, bool) {
+	primary := h.loadLive().APIKey
+	// 主密钥优先：空字符串 = 未启用鉴权（历史语义），此时不限域放行。
+	if httpauth.VerifyBearer(r, primary) {
+		if primary == "" {
+			return keyScope{}, true, false
+		}
+		return keyScope{Primary: true}, true, false
+	}
+	// 主密钥不匹配（或主密钥为空但请求带了别的 key）→ 查多密钥表。
+	token := bearerToken(r)
+	if token == "" {
+		return keyScope{}, false, false
+	}
+	k, found := h.cfg.APIKeys.Lookup(token)
+	if !found {
+		return keyScope{}, false, false
+	}
+	if k.Disabled {
+		return keyScope{}, false, true
+	}
+	return keyScope{Realm: k.Realm, Name: k.Name, KeyID: apikeys.Redact(k.Key)}, true, false
+}
+
+// bearerToken 从 Authorization 头剥出 Bearer 值（无则空串）。
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, prefix) {
+		return ""
+	}
+	return authz[len(prefix):]
+}
+
+// poolRealmOf 返回池内某账号的域（不存在/未知返回空串）。
+// 抽成小函数是为了让判域调用点读起来一致（面板、粘性校验共用同一口径）。
+func poolRealmOf(p *pool.Pool, uid string) string {
+	if p == nil {
+		return ""
+	}
+	if st, ok := p.Status(uid); ok {
+		return st.Realm
+	}
+	return ""
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -276,11 +377,71 @@ const (
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
+//
+// 密钥绑了域时只列该域的模型（并用**裸 id**，不加 "cn:"/"global:" 前缀）：
+// 客户端拿到的列表就是它能调的全部，不必记前缀、也看不到自己无权用的另一域模型。
+// 密钥不限域（主密钥 / 未启用多密钥）时按历史行为两域并列、带前缀。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	scope := scopeFrom(r)
+	if scope.Realm != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"object": "list",
+			"data":   h.modelListForRealm(scope.Realm),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
 	})
+}
+
+// modelListForRealm 只产出单域模型，id 为裸名（无 realm 前缀）。
+//
+// 为什么去前缀：该密钥只能落这一域，前缀在本密钥视角下是冗余噪音；而且带前缀的
+// id 会让「密钥已绑域」的客户端误以为需要继续写前缀。裸 id 配合密钥的域绑定，
+// 客户端代码与直连官方完全一致。
+//
+// 实现上复用 modelList() 再按前缀过滤并剥前缀，而不是复制两套探测逻辑：
+// 探测路径（fetchDynamicModels / fetchGlobalModels）有缓存与负缓存，重复实现
+// 会让两处缓存各自漂移。
+func (h *Handler) modelListForRealm(realm string) []map[string]any {
+	return filterEntriesByRealm(h.modelList(), realm)
+}
+
+// filterEntriesByRealm 从「两域并列、带前缀」的模型条目里挑出单域条目，
+// 并把 id 的域前缀 / name 的域标注都去掉。
+//
+// 抽成纯函数（不碰 Handler/Pool）的两个理由：
+//   - 可单测：前缀剥离、name 标注剥离、共享 map 不被就地改写这些细节值得钉住；
+//   - modelListForRealm 只剩一行取样逻辑，将来换探测实现不牵动这里。
+func filterEntriesByRealm(all []map[string]any, realm string) []map[string]any {
+	prefix := realm + ":"
+	label := apikeys.RealmLabel(realm)
+	out := make([]map[string]any, 0, len(all))
+	for _, entry := range all {
+		id, _ := entry["id"].(string)
+		if !strings.HasPrefix(id, prefix) {
+			continue
+		}
+		// 浅拷贝后改 id/name：不能就地改，all 里是共享的 map（同一次请求内
+		// 两个分支复用会互相污染，且 entry 也可能来自缓存构造的切片）。
+		cp := make(map[string]any, len(entry))
+		for k, v := range entry {
+			cp[k] = v
+		}
+		cp["id"] = strings.TrimPrefix(id, prefix)
+		// name 上的域标注（"[国际版] xxx"）对单域密钥无意义，去掉——客户端已经
+		// 只知道这一个域，标注反而变成噪音。兼容旧后缀形态一并剥，避免升级期间
+		// 混出 "[国内版] xxx (国内版)"。
+		if n, ok := cp["name"].(string); ok {
+			n = strings.TrimPrefix(n, "["+label+"] ")
+			n = strings.TrimSuffix(n, " ("+label+")")
+			cp["name"] = n
+		}
+		out = append(out, cp)
+	}
+	return out
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
@@ -294,6 +455,45 @@ func fmtCreditsPrefix(raw string) string {
 		return ""
 	}
 	return "[" + s + " credit]"
+}
+
+// realmModelName 给条目 name 打上域标识，使同名模型在两域并存时可区分。
+// 背景：上游目录里 cn/global 大量同名模型（deepseek-v4.1-flash、hy3、glm-5.2 …），
+// 而部分客户端（magpie 等）列表里展示的是 name 字段而非 id，导致「名字重复、
+// 分不清国内还是国际」。id 的 "cn:"/"global:" 前缀是路由协议不能动，故在 name
+// 上做人类可读的域标注。
+//
+// **前缀而非后缀**：客户端模型选择器常按固定宽度截断长名称（保留开头、尾部出
+// 省略号），后缀式的 "GLM-5.3 (国内版)" 一被截就成了 "GLM-5.3 (国内…" 甚至只剩
+// "GLM-5.3"，域信息正好丢在最需要它的地方。放在开头则永远先看见域。
+//
+// 方括号 + 短标签（[国内版] / [国际版]）而不是圆括号长句：模型名本身可能含括号
+// （如 "Hy4 preview"、"GLM-5.3 (xhigh)"），方括号在视觉上与名字本体区分明显，
+// 也更省宽度（客户端列表普遍较窄）。
+//
+// 已带同样前缀时不重复添加（幂等：modelListForRealm 会再走一遍去前缀逻辑，
+// 重复调用不该累积出 "[国内版] [国内版] xxx"）。realm 非法时原样返回（不编造）。
+func realmModelName(name, realm string) string {
+	if name == "" {
+		return name
+	}
+	tag := ""
+	switch realm {
+	case "cn":
+		tag = "[国内版] "
+	case "global":
+		tag = "[国际版] "
+	default:
+		return name
+	}
+	if strings.HasPrefix(name, tag) {
+		return name
+	}
+	// 兼容旧后缀形态（历史响应缓存/升级期间的旧快照）：先剥掉再重新加前缀，
+	// 避免出现 "[国内版] xxx (国内版)" 这种双重标注。
+	name = strings.TrimSuffix(name, " (国内版)")
+	name = strings.TrimSuffix(name, " (国际版)")
+	return tag + name
 }
 
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
@@ -378,6 +578,13 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
+		// 域区分：同一模型在两域都存在（deepseek-v4.1-flash / hy3 / glm-5.2 …），
+		// 只靠 id 前缀不够——展示 name 的客户端会看到两个一模一样的中文名。
+		// name 追加域标注 + 独立 realm 字段，客户端可直接按 realm 分组/筛选。
+		entry["realm"] = "cn"
+		if n, ok := entry["name"].(string); ok {
+			entry["name"] = realmModelName(n, "cn")
+		}
 		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
 		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
@@ -414,6 +621,12 @@ func (h *Handler) modelList() []map[string]any {
 			if mi, ok := globalInfos[id]; ok {
 				entry = applyModelInfoFields(entry, mi)
 				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
+			}
+			// 域区分（与 CN 分支同口径）：name 加域标注 + 独立 realm 字段。
+			// 未命中富字段（只有裸 id）时也要写 realm：客户端据此分组不依赖 name。
+			entry["realm"] = "global"
+			if n, ok := entry["name"].(string); ok {
+				entry["name"] = realmModelName(n, "global")
 			}
 			entry["context_length"] = upstream.ContextWindowListingV4(id, remoteCtx, h.cfg.Upstream.HTTP)
 			if mo, ok := upstream.MaxOutputTokensListingV4(id, remoteOut, h.cfg.Upstream.HTTP); ok {
@@ -535,7 +748,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	prefixRealm, bareModel := resolveModel(peek.Model)
+	// 密钥级域绑定（多密钥管理）：密钥绑了域就以它为准。
+	//
+	//   - 裸模型名（无前缀）：直接落到密钥的域（global 密钥不再被固定回落 cn）；
+	//   - 显式前缀与密钥域**冲突**：400 拒绝，不静默改域。
+	//     静默改域的后果是「客户端以为在打国际版，实际烧国内版积分」——计费错位比
+	//     直接报错难排查得多，所以这里选择硬失败。
+	//   - 显式前缀与密钥域一致 / 密钥不限域：按前缀走（历史行为）。
+	scope := scopeFrom(r)
+	realm := prefixRealm
+	if scope.Realm != "" {
+		if explicitRealmPrefix(peek.Model) && prefixRealm != scope.Realm {
+			writeOpenAIError(w, http.StatusBadRequest, "realm_mismatch",
+				fmt.Sprintf("this API key is bound to %q, but model %q requests realm %q",
+					scope.Realm, peek.Model, prefixRealm))
+			return
+		}
+		realm = scope.Realm
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -565,7 +796,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		//
+		// 传进去的模型名必须**带域**：粘性侧的 AvailableForModel 闭包靠前缀剥域
+		// （realmAwareAvailableForModel），裸名一律按 cn 取可用集合。密钥绑了域但
+		// 客户端发裸名时，这里补上密钥的域前缀——否则会先按 cn 分配一次，再被下方
+		// 「realm 不符 → 解绑」打回，白跑一次分配。
+		stickyModel := peek.Model
+		if scope.Realm != "" && !explicitRealmPrefix(stickyModel) {
+			stickyModel = scope.Realm + ":" + stickyModel
+		}
+		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, stickyModel); ok {
 			stickyUID = uid
 		}
 	}

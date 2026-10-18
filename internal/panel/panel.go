@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -65,6 +66,16 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// APIKeys 多密钥表（每个密钥可绑定国内版 / 国际版）。nil = 未启用，
+	// 密钥管理接口返回 501（裸用/测试场景）。
+	//
+	// 面板只负责编排（增删改查 + 落盘触发）；真正的鉴权在 server 侧读同一份 Store。
+	// 写操作后通过 SaveKeys 闭包把整表写回 config.json，实现重启后仍生效。
+	APIKeys *apikeys.Store
+	// SaveKeys 把密钥表持久化到 config.json（由 main 注入，落盘即热生效）。
+	// nil 时面板的写接口返回 501（只读部署 / 测试）。
+	SaveKeys func([]apikeys.Key) error
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -186,6 +197,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 多密钥管理（每个密钥可绑定国内版 / 国际版）。
+	p.mux.HandleFunc("GET /panel/api/api_keys", p.withAuth(p.apiKeysList))
+	p.mux.HandleFunc("POST /panel/api/api_keys", p.withAuth(p.apiKeyCreate))
+	p.mux.HandleFunc("POST /panel/api/api_keys/update", p.withAuth(p.apiKeyUpdate))
+	p.mux.HandleFunc("POST /panel/api/api_keys/remove", p.withAuth(p.apiKeyRemove))
+	p.mux.HandleFunc("POST /panel/api/api_keys/rotate", p.withAuth(p.apiKeyRotate))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -250,6 +267,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"paused":          paused,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
+		// realm_counts 按域（cn/global）分组的账号计数与积分合计：面板「国内版 /
+		// 国际版分开管理」的两张域卡片直接吃这份数据（一次遍历算完，不再按域
+		// 各调一遍计数函数）。两域恒定出现（0 账号也返回空结构），前端无需判空。
+		"realm_counts": p.cfg.Pool.CountsByRealm(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -371,6 +392,7 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	entry := map[string]any{
 		"id":                   realm + ":" + mi.ID,
 		"name":                 mi.Name,
+		"realm":                realm,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,
 		"can_disable_thinking": mi.CanDisableThinking,
@@ -598,62 +620,96 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // 批量任务
 // ---------------------------------------------------------------------------
 
-// checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
+// batchRealm 从批量任务请求里取域作用域（?realm=cn|global，缺省/未知 = 全池）。
+//
+// 用 query 参数而不是 body：批量接口既有调用方（前端按钮、外部脚本 curl）都
+// 不带 body，加一个可选 query 是纯增量，旧调用逐字不变（缺省全池）。
+// 非法值回落全池而不是报错——理由同 scheduler.normalizeRealm：拼错一个字母
+// 导致「一个号都没跑到」比「跑全池」更难排查。
+func batchRealm(r *http.Request) string {
+	switch v := strings.TrimSpace(r.URL.Query().Get("realm")); v {
+	case "cn", "global":
+		return v
+	default:
+		return ""
+	}
+}
+
+// batchRealmLabel 日志用的域标签（"cn" → "国内版"；"" → "全池"）。
+func batchRealmLabel(realm string) string {
+	switch realm {
+	case "cn":
+		return "国内版"
+	case "global":
+		return "国际版"
+	default:
+		return "全池"
+	}
+}
+
+// checkinAll 手动触发签到（异步执行，进度看日志区/账号状态变化）。
+// ?realm=cn|global 限定域；缺省全池。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	realm := batchRealm(r)
+	go p.cfg.Scheduler.RunCheckinRealm(realm)
+	log.Printf("panel: 手动签到已触发（%s，含猫猫旅行）", batchRealmLabel(realm))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
 
-// travelAll 手动触发全量猫猫旅行巡检（异步执行）。
+// travelAll 手动触发旅行巡检（异步执行）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
-	log.Printf("panel: 手动全量旅行巡检已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	realm := batchRealm(r)
+	go p.cfg.Scheduler.RunTravelRealm(realm)
+	log.Printf("panel: 手动旅行巡检已触发（%s）", batchRealmLabel(realm))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
 
-// activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
+// activityAll 手动触发活跃上报（异步执行；点亮连登 + 解锁领养前置）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
-	log.Printf("panel: 手动全量活跃上报已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	realm := batchRealm(r)
+	go p.cfg.Scheduler.RunActivityRealm(realm)
+	log.Printf("panel: 手动活跃上报已触发（%s）", batchRealmLabel(realm))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
 
-// keepaliveAll 手动触发全量 token 保活（异步执行）。
+// keepaliveAll 手动触发 token 保活（异步执行）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
-	log.Printf("panel: 手动全量保活已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	realm := batchRealm(r)
+	go p.cfg.Scheduler.RunKeepaliveRealm(realm)
+	log.Printf("panel: 手动保活已触发（%s）", batchRealmLabel(realm))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
 
-// balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
+// balanceAll 手动刷新余额：并发查上游、写回池内 credits（含解冻语义），
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+// ?realm=cn|global 限定域；缺省全池。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
+	realm := batchRealm(r)
+	p.cfg.Scheduler.RunBalanceRefreshRealm(realm)
 	p.syncNicknames()
-	log.Printf("panel: 手动全量余额刷新完成")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+	log.Printf("panel: 手动余额刷新完成（%s）", batchRealmLabel(realm))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "realm": realm, "accounts": p.cfg.Pool.List()})
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。

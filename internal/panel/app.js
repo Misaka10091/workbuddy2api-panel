@@ -338,7 +338,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', apikeys: 'API 密钥', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -349,6 +349,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'apikeys') loadApiKeys();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
@@ -367,15 +368,118 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* 域视图状态：'' = 全部（与历史行为逐字一致），'cn' / 'global' = 只看该域。
+   域筛选只影响**展示**与**批量按钮的作用域**，不改选号/路由语义（那是后端
+   pool 按 auth.Realm() 判定的事）。选择持久化到 localStorage，刷新后不跳回全部。 */
+const LS_ACC_REALM = 'wb2api.accRealm';
+// 初值就地归一：localStorage 可能留着旧版/手改的脏值（"all"、"CN"…）。
+// 脏值若原样留下，域切换条会三个按钮都不高亮、而列表又被 filter 成空。
+const accRealmStored = localStorage.getItem(LS_ACC_REALM);
+let accRealm = accRealmStored === 'cn' || accRealmStored === 'global' ? accRealmStored : '';
+
+// realmLabel 域的中文短名（表格/卡片/提示共用，避免各处硬编码不一致）。
+function realmLabel(r) {
+  return r === 'global' ? '国际版' : r === 'cn' ? '国内版' : '全部';
+}
+
+// accFiltered 按当前域筛选账号列表。realm 字段缺失（旧数据）按 cn 处理——
+// 与后端 Status.Realm 的缺省回落同向（空 domain 的老 CN 凭证判 cn）。
+//
+// 关键：这里对 accRealm 再做一次归一化。accRealm 初值直接取自 localStorage，
+// 用户手改/旧版本残留的脏值（"all"、"CN"、任意串）若不归一，会走进 filter 分支
+// 把列表全筛掉——表现为「账号池空了，但总览卡说有几个号」，最难排查的一类显示 bug。
+// 只有 cn/global 才过滤，其余一律视为「全部」。
+function accFiltered(list) {
+  const realm = accRealm === 'cn' || accRealm === 'global' ? accRealm : '';
+  if (!realm) return list;
+  return list.filter(s => (s.realm || 'cn') === realm);
+}
+
+/* renderRealmCards 渲染「国内版 / 国际版」域卡片：账号数 / 可用 / 冷却 / 禁用 /
+   暂停 / 积分合计，外加该域的批量按钮（点它只对该域生效）。
+
+   数据来自 overview.realm_counts（后端 pool.CountsByRealm 一次遍历算出）。
+   缺该字段（老后端/测试桩）时整块不渲染——不猜数字，也不显示 0 误导。 */
+function renderRealmCards(rc) {
+  const box = $('realmCards');
+  if (!box) return;
+  if (!rc) { box.innerHTML = ''; return; }
+  const order = [['cn', '国内版', 'CN'], ['global', '国际版', 'Global']];
+  box.innerHTML = order.map(([key, label, sub]) => {
+    const c = rc[key] || {};
+    const total = c.total || 0;
+    // 可用状态的语义色：0 个号 = 灰（没号），全禁用 = 红，无可用但有冷却 = 橙。
+    const dot = !total ? '' : (c.servable ? 'ok' : (c.healthy ? 'warn' : 'bad'));
+    const cred = c.credits_known
+      ? fmtTok(c.credits_total) + ' <span style="color:var(--ink-3);font-size:12px">/ ' + fmtTok(c.credits_total) + '</span>'
+      : fmtTok(c.credits || 0);
+    const extra = [];
+    if (c.enterprise) extra.push('企业版 ' + c.enterprise);
+    if (c.paused) extra.push('暂停 ' + c.paused);
+    if (c.in_flight_full) extra.push('占满 ' + c.in_flight_full);
+    return '<div class="realm-card' + (accRealm === key ? ' on' : '') + '" data-realm-card="' + key + '">' +
+      '<h4><span class="dot ' + dot + '"></span>' + label +
+        '<span style="color:var(--ink-3);font-weight:400;font-size:11.5px">' + sub + '</span>' +
+        '<span class="grow" style="flex:1"></span>' +
+        '<span style="color:var(--ink-3);font-weight:400;font-size:11.5px">' +
+          (total ? (c.servable ? '可服务' : '暂不可服务') : '无账号') + '</span></h4>' +
+      '<div class="kv">' +
+        '<div><div class="v">' + total + '</div><div class="k">账号</div></div>' +
+        '<div><div class="v good">' + (c.healthy || 0) + '</div><div class="k">可用</div></div>' +
+        '<div><div class="v' + ((c.cooling || 0) ? ' warn' : '') + '">' + (c.cooling || 0) + '</div><div class="k">冷却</div></div>' +
+        '<div><div class="v' + ((c.disabled || 0) ? ' bad' : '') + '">' + (c.disabled || 0) + '</div><div class="k">已禁用</div></div>' +
+        '<div><div class="v">' + cred + '</div><div class="k">积分剩余 / 总额</div></div>' +
+        '<div><div class="v" style="font-size:13px;line-height:1.6">' + (extra.join(' · ') || '—') + '</div><div class="k">其它</div></div>' +
+      '</div>' +
+      '<div class="acts">' +
+        '<button class="xs" data-realm-act="checkin" data-realm="' + key + '"' + (total ? '' : ' disabled') + '>签到</button>' +
+        '<button class="xs" data-realm-act="balance" data-realm="' + key + '"' + (total ? '' : ' disabled') + '>刷余额</button>' +
+        '<button class="xs" data-realm-act="keepalive" data-realm="' + key + '"' + (total ? '' : ' disabled') + '>保活</button>' +
+        '<button class="xs" data-realm-act="filter" data-realm="' + key + '">只看本域</button>' +
+      '</div></div>';
+  }).join('');
+}
+
+// setAccRealm 切换账号池的域筛选（空串 = 全部），并立即重渲染当前列表。
+function setAccRealm(realm) {
+  accRealm = realm === 'cn' || realm === 'global' ? realm : '';
+  try { localStorage.setItem(LS_ACC_REALM, accRealm); } catch (e) { /* 隐私模式忽略 */ }
+  document.querySelectorAll('#accRealmSwitch button').forEach(b => {
+    const on = (b.dataset.realm || '') === accRealm;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  if (overviewData) {
+    renderAccounts(overviewData.accounts || []);
+    renderRealmCards(overviewData.realm_counts);
+  }
+  syncBatchButtonLabels();
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
-  if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+  // 域计数徽标（switch 里的数字）用**全量**账号算，不受当前筛选影响：
+  // 否则切到国内版后「国际版 N」会变成 0，看着像号丢了。
+  const counts = { '': (list || []).length, cn: 0, global: 0 };
+  for (const s of (list || [])) counts[(s.realm || 'cn') === 'global' ? 'global' : 'cn']++;
+  const nAll = $('accRealmAllN'), nCn = $('accRealmCnN'), nGl = $('accRealmGlN');
+  if (nAll) nAll.textContent = counts[''];
+  if (nCn) nCn.textContent = counts.cn;
+  if (nGl) nGl.textContent = counts.global;
+
+  const shown = accFiltered(list || []);
+  if (!shown.length) {
+    // 空池 vs 该域没有账号要说清：后者是筛选结果，不是「池子空了」。
+    tb.innerHTML = (list || []).length
+      ? '<tr><td colspan="9"><div class="empty"><div class="big">' + realmLabel(accRealm) + '暂无账号</div>' +
+        '该域没有账号，切到「全部」或在「添加账号」里选' + realmLabel(accRealm) + '</div></td></tr>'
+      : '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  tb.innerHTML = list.map(s => {
+  // maxCred 按**展示集合**取最高：只看国际版时进度条以国际版最高额为 100%，更有可比性。
+  const maxCred = Math.max(1, ...shown.map(s => s.credits || 0));
+  tb.innerHTML = shown.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -423,7 +527,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + ' <span class="realm-tag">' + realmLabel(s.realm || 'cn') + '</span>' + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -512,12 +616,64 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    // 域卡片与账号表都用同一份响应：卡片吃 realm_counts，表格按当前域筛选。
+    // 顺序有意义——先渲染卡片只为拿 realm_counts，表格的计数徽标自己算。
+    renderRealmCards(d.realm_counts);
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
     // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
     if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
+}
+
+/* 批量任务的作用域：当前选中的域（'' = 全部，不带参数 = 全池）。
+   URL 拼接而非 body：后端 batchRealm 读 ?realm=，缺省即全池（旧行为逐字不变）。 */
+function realmQuery(realm) {
+  return realm ? '?realm=' + encodeURIComponent(realm) : '';
+}
+
+// runBatchAction 统一的批量动作入口（域名 + 动作类型 + 成功提示）。
+// 域卡片按钮与表格头上的批量按钮共用——两处语义完全一致，不再各写一遍 fetch。
+async function runBatchAction(realm, act) {
+  const API = {
+    checkin: ['checkin_all', '签到已开始，结果见日志'],
+    balance: ['balance_all', '余额已从上游刷新'],
+    keepalive: ['keepalive_all', '保活已开始，结果见日志'],
+    travel: ['travel_all', '旅行巡检已开始（含领养链路），结果见日志'],
+    activity: ['activity_all', '活跃上报已开始，结果见日志'],
+  }[act];
+  if (!API) return;
+  const [path, okMsg] = API;
+  const scope = realmLabel(realm);
+  try {
+    await api(path + realmQuery(realm), { method: 'POST' });
+    toast(scope + '：' + okMsg, 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  // balance_all 同步返回、其余异步触发；统一在结束后拉一次 overview 让数字立刻动。
+  loadOverview(true);
+}
+
+/* 域切换条：点「全部 / 国内版 / 国际版」筛账号池（只影响展示与批量作用域）。 */
+if ($('accRealmSwitch')) {
+  $('accRealmSwitch').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-realm]');
+    if (!b) return;
+    setAccRealm(b.dataset.realm || '');
+  });
+  // 首屏把持久化的域选择反映到按钮上（DOM 默认是「全部」选中态）。
+  setAccRealm(accRealm);
+}
+
+/* 域卡片内的按钮：签到 / 刷余额 / 保活 只对该域生效；「只看本域」等价于点切换条。 */
+if ($('realmCards')) {
+  $('realmCards').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-realm-act]');
+    if (!b || b.disabled) return;
+    const realm = b.dataset.realm, act = b.dataset.realmAct;
+    if (act === 'filter') { setAccRealm(accRealm === realm ? '' : realm); return; }
+    runBatchAction(realm, act);
+  });
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -556,22 +712,183 @@ $('accBody').addEventListener('click', async ev => {
   finally { b.disabled = false; loadOverview(true); }
 });
 
-$('btnCheckinAll').onclick = async () => {
-  try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnKeepaliveAll').onclick = async () => {
-  try { await api('keepalive_all', { method: 'POST' }); toast('全部保活已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnTravelAll').onclick = async () => {
-  try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnActivityAll').onclick = async () => {
-  try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
-  catch (e) { toast(e.message, 'err'); }
-};
+/* 表头批量按钮：作用域跟随当前域筛选（「全部」时不带参数 = 全池，与历史行为一致）。
+   按钮文案也随域刷新——让「当前这批按钮只动哪一域」在点击前就看得见。 */
+function syncBatchButtonLabels() {
+  const sc = realmLabel(accRealm);
+  const set = (id, base) => { const el = $(id); if (el) el.textContent = accRealm ? sc + base : base; };
+  set('btnCheckinAll', '签到');
+  set('btnTravelAll', '旅行巡检');
+  set('btnActivityAll', '活跃上报');
+  set('btnKeepaliveAll', '保活');
+}
+
+$('btnCheckinAll').onclick = () => runBatchAction(accRealm, 'checkin');
+$('btnKeepaliveAll').onclick = () => runBatchAction(accRealm, 'keepalive');
+$('btnTravelAll').onclick = () => runBatchAction(accRealm, 'travel');
+$('btnActivityAll').onclick = () => runBatchAction(accRealm, 'activity');
+
+/* ── API 密钥（多密钥，每把绑定国内版 / 国际版）───────────────────── */
+/* 展示约定：
+   - 列表默认脱敏（akReveal=false），点「显示明文」才向服务端要 ?reveal=1；
+   - 新建/轮换返回的明文只在当次弹窗里展示一次，并写进「刚创建」提示条；
+   - 主密钥（config.api_key）单列一行、标 primary、无删除按钮。 */
+let akKeys = [];
+let akReveal = false;
+let akRealms = [];
+
+// akRealmLabel 用服务端给的标签（realms 数组），缺失时本地兜底。
+function akRealmLabel(value) {
+  const hit = akRealms.find(r => r.value === (value || ''));
+  if (hit) return hit.label;
+  return value === 'global' ? '国际版' : value === 'cn' ? '国内版' : '不限域';
+}
+
+function renderApiKeys() {
+  const tb = $('akBody');
+  if (!tb) return;
+  if (!akKeys.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">还没有密钥</div>上方选择「国内版」或「国际版」后点「创建密钥」</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = akKeys.map(k => {
+    const primary = !!k.primary;
+    const disabled = !!k.disabled;
+    const st = disabled ? '<span class="tag bad">已停用</span>'
+      : primary ? '<span class="tag ok">生效中</span>'
+      : '<span class="tag ok">生效中</span>';
+    const realmTag = '<span class="realm-tag">' + esc(akRealmLabel(k.realm)) + '</span>';
+    // 主密钥行只读：不提供改域/停用/删除/轮换（它是面板的进门钥匙）。
+    const acts = primary
+      ? '<span class="note">主密钥不可在此修改</span>'
+      : (disabled
+        ? '<button class="xs primary" data-ak="enable" data-k="' + esc(k.key) + '">启用</button>'
+        : '<button class="xs ghost" data-ak="disable" data-k="' + esc(k.key) + '">停用</button>') +
+        '<button class="xs ghost" data-ak="rotate" data-k="' + esc(k.key) + '" title="生成新密钥值，旧值立即失效">轮换</button>' +
+        '<button class="xs ghost" data-ak="copy" data-k="' + esc(k.key) + '">复制</button>' +
+        '<button class="xs ghost danger" data-ak="remove" data-k="' + esc(k.key) + '">删除</button>';
+    const realmSel = primary
+      ? realmTag
+      : '<select class="xs" data-ak-realm="' + esc(k.key) + '">' +
+          [['cn', '国内版'], ['global', '国际版'], ['', '不限域']].map(([v, l]) =>
+            '<option value="' + v + '"' + ((k.realm || '') === v ? ' selected' : '') + '>' + l + '</option>').join('') +
+        '</select>';
+    return '<tr class="' + (disabled ? 'off' : '') + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td class="who"><div class="nm">' + esc(k.name || '未命名') + '</div>' +
+        (k.created_at ? '<div class="id">' + esc(String(k.created_at).slice(0, 16).replace('T', ' ')) + '</div>' : '') + '</td>' +
+      '<td><code style="font-size:12px">' + esc(k.key) + '</code></td>' +
+      '<td>' + realmSel + '</td>' +
+      '<td>' + st + '</td>' +
+      '<td>' + (k.note ? esc(k.note) : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
+      '<td class="acts">' + acts + '</td></tr>';
+  }).join('');
+  if ($('akListNote')) {
+    const own = akKeys.filter(k => !k.primary).length;
+    $('akListNote').textContent = own + ' 把自定义密钥' + (akReveal ? ' · 明文可见' : ' · 已脱敏');
+  }
+}
+
+async function loadApiKeys() {
+  const tb = $('akBody');
+  if (tb && !akKeys.length) tb.innerHTML = '<tr><td colspan="7"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('api_keys' + (akReveal ? '?reveal=1' : ''));
+    akKeys = d.keys || [];
+    akRealms = d.realms || [];
+    renderApiKeys();
+  } catch (e) {
+    if (tb) tb.innerHTML = '<tr><td colspan="7"><div class="empty">读取失败：' + esc(e.message) + '</div></td></tr>';
+    if ($('akListNote')) $('akListNote').textContent = '读取失败';
+  }
+}
+
+// akShowSecret 把新生成的明文醒目地摆出来（只此一次，列表刷新后变脱敏）。
+function akShowSecret(label, key) {
+  if ($('akCreateMsg')) {
+    $('akCreateMsg').innerHTML = label + '：<code style="user-select:all">' + esc(key) + '</code>';
+  }
+  if (navigator.clipboard) navigator.clipboard.writeText(key).catch(() => {});
+  toast('密钥已生成并复制到剪贴板', 'ok');
+}
+
+if ($('btnAkCreate')) {
+  $('btnAkCreate').onclick = async () => {
+    const b = $('btnAkCreate');
+    b.disabled = true;
+    try {
+      const r = await api('api_keys', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: $('akName').value.trim(),
+          realm: $('akRealm').value,
+          key: $('akKey').value.trim(),
+        }),
+      });
+      akShowSecret('已创建（' + akRealmLabel(r.realm) + '）', r.key);
+      if (r.persist_error) toast('落盘失败：' + r.persist_error, 'err');
+      $('akKey').value = '';
+      akReveal = true;
+      loadApiKeys();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { b.disabled = false; }
+  };
+}
+
+if ($('btnAkReload')) $('btnAkReload').onclick = () => loadApiKeys();
+if ($('btnAkReveal')) {
+  $('btnAkReveal').onclick = () => {
+    akReveal = !akReveal;
+    $('btnAkReveal').textContent = akReveal ? '隐藏明文' : '显示明文';
+    loadApiKeys();
+  };
+}
+
+if ($('akBody')) {
+  // 改绑定版本：change 即提交（下拉选择比逐个弹窗确认更顺手）。
+  $('akBody').addEventListener('change', async ev => {
+    const sel = ev.target.closest('select[data-ak-realm]');
+    if (!sel) return;
+    try {
+      await api('api_keys/update', {
+        method: 'POST',
+        body: JSON.stringify({ key: sel.dataset.akRealm, realm: sel.value }),
+      });
+      toast('已改为 ' + akRealmLabel(sel.value) + '（立即生效）', 'ok');
+      loadApiKeys();
+    } catch (e) { toast(e.message, 'err'); loadApiKeys(); }
+  });
+  $('akBody').addEventListener('click', async ev => {
+    const b = ev.target.closest('button[data-ak]');
+    if (!b) return;
+    const act = b.dataset.ak, key = b.dataset.k;
+    if (act === 'remove' && !confirm('删除后使用该密钥的客户端会立即 401，且不可恢复。确认删除？')) return;
+    if (act === 'rotate' && !confirm('轮换会立即废弃旧密钥值，使用旧值的客户端会 401。确认轮换？')) return;
+    if (act === 'copy') {
+      navigator.clipboard.writeText(key).then(() => toast('已复制', 'ok'), () => toast('复制失败', 'err'));
+      return;
+    }
+    b.disabled = true;
+    try {
+      if (act === 'disable' || act === 'enable') {
+        await api('api_keys/update', {
+          method: 'POST',
+          body: JSON.stringify({ key, disabled: act === 'disable' }),
+        });
+        toast(act === 'disable' ? '已停用（该密钥请求会 401）' : '已启用', 'ok');
+      } else if (act === 'rotate') {
+        const r = await api('api_keys/rotate', { method: 'POST', body: JSON.stringify({ key }) });
+        akShowSecret('已轮换，新密钥', r.key);
+        akReveal = true;
+      } else if (act === 'remove') {
+        await api('api_keys/remove', { method: 'POST', body: JSON.stringify({ key }) });
+        toast('已删除', 'ok');
+      }
+      loadApiKeys();
+    } catch (e) { toast(e.message, 'err'); loadApiKeys(); }
+    finally { b.disabled = false; }
+  });
+}
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
@@ -664,7 +981,9 @@ function mdRateValue(m) {
 
 // mdSearchText 参与关键字搜索的字段（ID / 展示名 / 厂商 / 描述 / 标签）。
 function mdSearchText(m) {
-  return [m.id, m.name, m.vendor, m.description, (m.tags || []).join(' ')]
+  // realm 并入搜索文本：可直接搜「国内」「国际」筛域（与 mdRealm 下拉同效果，更快）。
+  const reLabel = String(m.id || '').startsWith('global:') ? '国际版 global' : '国内版 cn';
+  return [m.id, m.name, m.vendor, m.description, (m.tags || []).join(' '), reLabel]
     .filter(Boolean).join(' ').toLowerCase();
 }
 
@@ -721,7 +1040,11 @@ function mdRowHtml(m, pr) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  // 域标签：两域存在大量同名模型（hy3 / glm-5.2 / deepseek-v4.1-flash …），
+  // 副行只显示 name 时看不出国内版还是国际版，这里补一个短标签。
+  const re = String(m.realm || (String(m.id || '').startsWith('global:') ? 'global' : 'cn'));
+  const realmTag = '<span class="realm-tag">' + (re === 'global' ? '国际版' : '国内版') + '</span> ';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + realmTag + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +

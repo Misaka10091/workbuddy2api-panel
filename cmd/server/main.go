@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -238,6 +239,20 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 	})
+	// 多密钥表（每个密钥可绑定国内版 / 国际版）。
+	// 非法条目跳过并记 WARN：一条脏密钥不该让正在服务的网关拒绝启动。
+	keyStore, keyErrs := apikeys.New(cfg.APIKeys)
+	for _, e := range keyErrs {
+		log.Printf("WARN: api_keys 条目被忽略: %v", e)
+	}
+	if n := keyStore.Len(); n > 0 {
+		byRealm := map[string]int{}
+		for _, k := range keyStore.List() {
+			byRealm[k.Realm]++
+		}
+		log.Printf("多密钥已启用：%d 把（国内版 %d / 国际版 %d / 不限域 %d）；config.api_key 仍为主密钥（不限域）",
+			n, byRealm["cn"], byRealm["global"], byRealm[""])
+	}
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -278,11 +293,21 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		APIKeys:    keyStore,
+		// SaveKeys 把面板上改过的密钥表写回 config.json（落盘即热生效，重启仍在）。
+		// 走同一套 mergeConfigMaps + ParseConfig 校验路径，不另开一条"只写密钥"的
+		// 旁路——两条落盘路径迟早会写出互相冲突的文件。
+		SaveKeys: func(keys []apikeys.Key) error {
+			_, err := saveConfig(
+				mergedJSON(map[string]any{"api_keys": keys}),
+				*cfgPath, live, p, up, sch, keyStore)
+			return err
+		},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, keyStore)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
@@ -295,6 +320,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		APIKeys:      keyStore,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -419,7 +445,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, keys *apikeys.Store) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -505,6 +531,15 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	// 密钥表热替换：整表原子换掉（校验失败条目跳过并记 WARN，不阻断保存——
+	// 用户改的是别的字段时不该因为一条密钥拼错就整份配置存不下去）。
+	if keys != nil {
+		if errs := keys.Replace(newCfg.APIKeys); len(errs) > 0 {
+			for _, e := range errs {
+				log.Printf("WARN: 保存配置时 api_keys 条目被忽略: %v", e)
+			}
+		}
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

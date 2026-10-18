@@ -455,8 +455,98 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 	return t, h, c, d + pz, f
 }
 
+// CountsDetailedWithPausedForRealm 是 CountsDetailedWithPaused 的分域版本：
+// 只统计 Realm()==realm 的账号，paused 与 disabled 分开返回；realm=="" 退化为全池。
+//
+// 为什么需要独立方法而不是让调用方分别调两个现有函数：面板「国内版 / 国际版分开
+// 管理」要在每个域卡片上同时显示「禁用 N / 暂停 M」，而 CountsDetailedForRealm 把
+// paused 并进了 disabled（/status 的「不可用」口径），拆不回来。语义与合并规则
+// 仍由调用方决定，本方法只提供完整的六元组。
+func (p *Pool) CountsDetailedWithPausedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
+	return p.countsDetailedForRealm(realm)
+}
+
+// RealmCounts 单个域的账号计数快照（面板「国内版 / 国际版分开管理」用）。
+//
+// 一次遍历同时算出「账号数 / 可用 / 冷却 / 禁用 / 暂停 / 在途占满 / 积分」，
+// 避免面板为两个域各调 5 次计数函数（每次都全表遍历一遍）。
+type RealmCounts struct {
+	Realm        string `json:"realm"`
+	Total        int    `json:"total"`
+	Healthy      int    `json:"healthy"`
+	Cooling      int    `json:"cooling"`
+	Disabled     int    `json:"disabled"`
+	Paused       int    `json:"paused"`
+	InFlightFull int    `json:"in_flight_full"`
+	// Credits / CreditsTotal 该域积分合计：CreditsTotal 只累加已知总额的账号
+	// （credits_total>0；企业版 -1 不限量不参与累加），credits_known=false 表示
+	// 没有任何账号拿到过总额，前端据此决定是否显示「剩余 / 总额」。
+	Credits       int64 `json:"credits"`
+	CreditsTotal  int64 `json:"credits_total"`
+	CreditsKnown  bool  `json:"credits_known"`
+	EnterpriseNum int   `json:"enterprise"`
+	Servable      bool  `json:"servable"`
+}
+
+// CountsByRealm 一次遍历产出每个域的 RealmCounts（键 "cn" / "global"）。
+//
+// 与 CountsDetailedForRealm 的口径差异：这里 disabled 与 paused **分开**计
+// （面板要分别显示「禁用 N / 暂停 M」），且同时汇总该域积分合计——此前面板只能
+// 把所有账号的积分加在一起，混池时看不出「国内版还剩多少、国际版还剩多少」。
+//
+// 两域恒定出现在结果里（即使该域 0 个账号），面板无需判空即可直接渲染；
+// realm 取值经 auth.Realm() 归一化，与选号/路由侧完全同源。
+func (p *Pool) CountsByRealm() map[string]RealmCounts {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	out := map[string]RealmCounts{
+		"cn":     {Realm: "cn"},
+		"global": {Realm: "global"},
+	}
+	for _, e := range p.byUID {
+		realm := e.a.Realm()
+		rc, ok := out[realm]
+		if !ok {
+			// 未预期域（逃生门/未来扩展）也要计进自己的桶，而不是静默丢弃。
+			rc = RealmCounts{Realm: realm}
+		}
+		rc.Total++
+		switch {
+		case e.disabled:
+			rc.Disabled++
+		case e.paused:
+			rc.Paused++
+		case !e.healthy(now):
+			rc.Cooling++
+		default:
+			rc.Healthy++
+			if p.inFlightFull(e) {
+				rc.InFlightFull++
+			}
+		}
+		// Servable 与 ServableForRealm 同口径（存在性语义：healthy 或模型级豁免形态，
+		// 且未占满在途名额），面板据此显示「该域当前能否接流量」。
+		if !rc.Servable && !p.inFlightFull(e) && (e.healthy(now) || e.modelExempt()) {
+			rc.Servable = true
+		}
+		if e.a.IsEnterprise() {
+			rc.EnterpriseNum++
+		}
+		// 积分合计：creditsTotal>0 才认为该账号的余额是「查过并已知」的（现有口径：
+		// 0 = 未知/旧 state/查询失败，见 entry.creditsTotal 注释）。未查到的账号只是
+		// 少算，不影响同域其它账号的合计。
+		rc.Credits += e.credits
+		if e.creditsTotal > 0 {
+			rc.CreditsTotal += e.creditsTotal
+			rc.CreditsKnown = true
+		}
+		out[realm] = rc
+	}
+	return out
+}
+
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-// countsDetailedForRealm 是共用遍历实现；realm=="" 不加谓词。
 //
 // paused 单独返回、不并进 disabled：调用方按自己的口径决定合不合并。
 // /status 要的是「还能不能用」（暂停与禁用同样不可选，合并）；面板概况要的是

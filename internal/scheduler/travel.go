@@ -46,7 +46,16 @@ func travelDay(t time.Time) string {
 // 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
-func (s *Scheduler) RunTravelNow() {
+// 等价于 RunTravelRealm("")（全池，既有行为）。
+func (s *Scheduler) RunTravelNow() { s.RunTravelRealm("") }
+
+// RunTravelRealm 旅行巡检，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunTravelNow 的现状语义）。
+//
+// 注意域作用域**不解除** D4 门控：global 账号本就没有 CN 旅行体系，
+// 显式指定 realm="global" 也照样跳过（不发起任何上游调用）。
+func (s *Scheduler) RunTravelRealm(realm string) {
+	realm = normalizeRealm(realm)
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -54,6 +63,9 @@ func (s *Scheduler) RunTravelNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		if a.IsGlobal() {

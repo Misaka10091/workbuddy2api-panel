@@ -19,7 +19,14 @@ var nowForNightWindow = time.Now
 
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
-func (s *Scheduler) RunBlackcatNow() {
+// 等价于 RunBlackcatRealm("")（全池，既有行为）。
+func (s *Scheduler) RunBlackcatNow() { s.RunBlackcatRealm("") }
+
+// RunBlackcatRealm 夜猫子对话补足，仅作用于指定域（"cn"/"global"）的账号；
+// realm=="" 等价于全池（RunBlackcatNow 的现状语义）。
+// 域作用域不解除 D4 门控：global 账号本就没有 CN 夜猫子活动，照样跳过。
+func (s *Scheduler) RunBlackcatRealm(realm string) {
+	realm = normalizeRealm(realm)
 	if !upstream.InNightWindow(nowForNightWindow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
@@ -33,6 +40,9 @@ func (s *Scheduler) RunBlackcatNow() {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		if !inScope(a, realm) {
 			continue
 		}
 		if a.IsGlobal() {
