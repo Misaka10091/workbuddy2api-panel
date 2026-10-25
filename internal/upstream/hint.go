@@ -61,6 +61,17 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
+	case ErrUpstreamBusy:
+		// 渠道级容量信号（6020 queue.waiting / 6021 queue.full）：换号打的是同一堵墙，
+		// 客户端唯一有效的动作是等一小会儿再重试（网关已带 Retry-After）。
+		return "upstream channel is at capacity (queue waiting/full); retry after a short wait — switching accounts will not help"
+	case ErrToolMismatch:
+		// 11148：请求内容级配对断裂，上游明示「直接重试无效，请新建任务」。
+		return "tool calls and tool results do not match in this request; start a new conversation (retrying the same body fails identically)"
+	case ErrModelParamInvalid:
+		// 11133 家族通常已被上方 isModelParamInvalid 分支接走；这里是兜底
+		// （msg 形态未命中词表但分类已是 ErrModelParamInvalid 的情形）。
+		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	case ErrContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
