@@ -926,7 +926,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID, convReqID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	maxOut := c.maxOutSnapshot(realm)
 	if realmKey(realm) == "global" {
@@ -939,6 +939,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// body 侧轮级字段（conversationRequestId / startsNewUserRequest / agent）：
+	// 官方把头里的轮级 ID 同时写进当前轮 user 消息，只写头不写体会形成头体不一致。
+	body = injectConversationFields(body, convReqID)
 	return body
 }
 
@@ -1222,7 +1225,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID, meta.ConversationRequestID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}

@@ -980,6 +980,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
+	// 渠道校验兜底：上游要求 messages[0] 必须是 system（首条 user 直接 400 11-128
+	//「first message is not system prompt」，首条 developer 报 unapproved channel）。
+	// custom/append 天然以 system 开头，passthrough 透传客户端消息时可能首条就是 user，
+	// 故这里统一兜一次。只补首条缺失这一种情况，其余消息逐字不动。
+	body = prompt.EnsureSystemFirst(body, h.cfg.PromptText)
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
@@ -1765,6 +1770,17 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
+			// 「request illegal」骑两个不同业务码，处置必须分开：
+			//   - 11-128（**渠道校验**）→ 上游 displayTips 写着「请重新发送」「渠道校验
+			//     失败，可能不是从官方客户端发出的」：请求级可重试信号（实测凭证/余额/
+			//     JWT 全正常、换模型换头不改结果、同号在别的客户端可用）。永久禁用等于
+			//     把好号踢出池子还要人工解冻 → 软冷却，上游解除后自愈。
+			//   - 11140（数字）→ auth_forbidden 账号级授权风控：硬禁用。
+			if upstream.HasCodeMarker(body, "11-128") {
+				h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{},
+					"channel verification blocked (11-128 request illegal)")
+				return
+			}
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
