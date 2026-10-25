@@ -148,17 +148,18 @@ func TestDesktopUAForGlobalAccount(t *testing.T) {
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
 	ua := c.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy AI"; !contains(ua, want) {
+	// 国际版品牌段是小写连字符 slug（真机抓包），首段仍为驼峰 WorkBuddy。
+	if want := "workbuddy-ai"; !contains(ua, want) {
 		t.Errorf("global desktop UA = %q, want it to contain %q", ua, want)
 	}
 	if !contains(ua, "CLI/") {
 		t.Errorf("global desktop UA = %q, want CLI segment", ua)
 	}
-	// CN 账号保持 WorkBuddy（零回归）。
+	// CN 账号保持驼峰 WorkBuddy，且不得出现国际版品牌段。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "WorkBuddy AI") {
-		t.Errorf("cn desktop UA = %q, must not contain 'WorkBuddy AI'", ua)
+	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "workbuddy-ai") || contains(ua, "WorkBuddy AI") {
+		t.Errorf("cn desktop UA = %q, must not carry the global brand segment", ua)
 	}
 }
 

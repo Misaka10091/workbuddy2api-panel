@@ -40,8 +40,9 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
-	if gotUA != desktopUA {
-		t.Errorf("UA=%q want %q", gotUA, desktopUA)
+	wantUA := desktopUAFor(nil)
+	if gotUA != wantUA {
+		t.Errorf("UA=%q want %q", gotUA, wantUA)
 	}
 	if len(got) != 1 {
 		t.Fatalf("events=%d want 1", len(got))
@@ -102,7 +103,7 @@ func TestSetAppearanceTheme(t *testing.T) {
 		if r.URL.Path != "/v2/user-asset/appearance/set" {
 			t.Errorf("path=%s want /v2/user-asset/appearance/set", r.URL.Path)
 		}
-		if r.Header.Get("User-Agent") != desktopUA {
+		if r.Header.Get("User-Agent") != desktopUAFor(nil) {
 			t.Errorf("UA=%q want desktop UA", r.Header.Get("User-Agent"))
 		}
 		raw, _ := io.ReadAll(r.Body)
