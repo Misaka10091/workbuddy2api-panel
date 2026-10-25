@@ -177,6 +177,52 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 }
 
+// modelBusyBase/modelBusyMax 14003「模型繁忙」的独立停车窗口。
+//
+// 不复用 soft_rate 家族：那套阶梯（默认 600s 起、按命中翻倍、封顶 2h）是给
+// 「这个账号/模型被持续限流」准备的，惩罚一次瞬时抖动代价过高。14003 的文案就是
+// 「模型繁忙，请换模型或稍后重试」——它是**间歇**的（生产日志里同一分钟内既有
+// 14003 也有成功），所以首档取 10s 而不是分钟级。同一 (号, 模型) 反复命中再翻倍，
+// 封顶 1 分钟——宁可多交一次 429，也不要把间歇繁忙的模型停成整分钟不可用。
+const (
+	modelBusyBase = 10 * time.Second
+	modelBusyMax  = time.Minute
+)
+
+// CooldownModelBusy 把 (账号, 模型) 停一个短窗口（14003 模型繁忙专用）。
+//
+//   - 只写 modelCooldowns[model]，不碰账号级 until：同号换模型立即可用。
+//   - 同一窗口内重复命中不延长（并发请求/兜底探测不得把 10s 堆成分钟级）。
+//   - 已有更晚的冷却（6004 墙钟 / 11102 负缓存）时保留原截止，不缩短。
+func (p *Pool) CooldownModelBusy(uid, model, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	if old, exists := e.modelCooldowns[model]; exists && old.Until.After(now) {
+		return
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	hits := e.modelCooldowns[model].Hits + 1
+	d := modelBusyBase
+	for i := 1; i < hits && d < modelBusyMax; i++ {
+		d *= 2
+	}
+	if d > modelBusyMax {
+		d = modelBusyMax
+	}
+	e.modelCooldowns[model] = modelCooldown{Until: now.Add(d), Reason: reason, Hits: hits}
+	p.dirty.Store(true)
+}
+
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
 // 典型场景是 6004 没有可解析重置时间：账号仍按原有有界退避冷却，
 // 本方法只把模型名挂到 e.until 上供账号页展示，不影响 healthyForModel。
@@ -288,7 +334,9 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
+	// 11102「该后端无此模型」/ 11158「该账号类型无权使用」都是确定性负缓存：
+	// 权限或路由恢复后，成功请求必须能清掉，否则模型会被永久锁在本账号上。
+	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
 		return
 	}
 	delete(e.modelCooldowns, model)

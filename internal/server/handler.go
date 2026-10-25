@@ -1209,21 +1209,66 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
-			// 账号都是同样的解析结果，轮转只会放大无效请求（每号一次上游调用 +
-			// rotateBackoff 占用在途名额）。更要紧的是：继续轮转后末端会落到
-			// 「其余保持 503」，把确定失败的请求伪装成"账号不可用、稍后再试"，
-			// 客户端于是对必然失败的请求无限重试。立即透传上游原文回 400。
-			if kind == upstream.ErrBadParams {
+			// 请求级参数拒绝（11101 请求体解析失败 / 11133 模型供应商拒绝参数）：与
+			// 11115 / 图片无效同一哲学——同一 body 换任何账号都是同样的拒绝，轮转只会
+			// 放大无效请求（每号一次上游调用 + rotateBackoff 占用在途名额）。更要紧的
+			// 是：继续轮转后末端会落到「其余保持 503」，把确定失败的请求伪装成
+			// "账号不可用、稍后再试"，客户端于是对必然失败的请求无限重试。
+			// 立即透传上游原文回 400。
+			if kind == upstream.ErrBadParams || kind == upstream.ErrModelParamInvalid {
+				code, fallback := "bad_params", "chat request body was rejected by upstream"
+				if kind == upstream.ErrModelParamInvalid {
+					code, fallback = "model_param_invalid", "request parameters were rejected by the upstream model provider"
+				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
-					msg = "chat request body was rejected by upstream"
+					msg = fallback
 				}
-				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
-					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
+				writeOpenAIErrorHint(w, http.StatusBadRequest, code, msg,
+					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 11148「tool calls and tool results do not match」：请求内容级配对断裂。
+			// 上游明示「直接重试无效，请新建任务」——同一 body 换任何账号都撞同一处，
+			// 轮转只会把整池健康号逐个白打一遍（还会按 ErrClient 喂连败降权），客户端
+			// 等完全池后拿到 503「账号不可用」，与账号健康毫无关系。
+			// fail-fast 400 透传上游原文，不罚号不轮转。
+			if kind == upstream.ErrToolMismatch {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream rejected the request: tool calls and tool results do not match"
+				}
+				writeOpenAIErrorHint(w, http.StatusBadRequest, "tool_call_mismatch", msg,
+					h.hintOf(upstream.ErrToolMismatch, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
+			// 6020/6021 渠道级排队/队列满：上游容量信号，与账号健康无关。按限流处置
+			// 会逐号软冷却、与全冷却兜底互相喂成整池停摆，且换号把无效请求放大
+			// MaxRotate 倍。fail-fast 503 透传原文 + Retry-After（上游未给重置口径时
+			// 按 5s 兜底提示），客户端按 SDK 退避重试即可。
+			if kind == upstream.ErrUpstreamBusy {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				}
+				retryAfter := "5"
+				if uerr != nil && uerr.RetryAfter > 0 && int64(uerr.RetryAfter.Seconds()) > 0 {
+					retryAfter = fmt.Sprintf("%d", int64(uerr.RetryAfter.Seconds()))
+				}
+				w.Header().Set("Retry-After", retryAfter)
+				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
+					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
@@ -1622,6 +1667,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 14003「当前模型请求繁忙」：瞬时抖动，走独立短窗（10s 起、封顶 1m），
+		// 不套 soft_rate 的 600s→2h 阶梯——套上去会把一次抖动放大成整池十分钟不可用。
+		// 必须判在 IsModelRateLimit 之前：14003 也在模型级限流码集合里。
+		if upstream.IsModelBusy(body) {
+			h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
+			return
+		}
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
@@ -1698,10 +1750,21 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 已 fail-fast 400 透传原文、终止轮转——「换号可能有不同模型权限」属 11102
 		// （ErrModelBlocked）的分类域，与本类无关。
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
-		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
+		// 11102「该后端无此模型」/ 11158「该账号类型无权使用」：(账号, 模型) 负缓存
+		// 避让。复用 modelCooldowns 机制（与 6004 同域），选号侧 healthyForModel 对该
+		// 账号自动避开该模型。reason 按上游 code 区分（11102/11158），便于台账读因。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
-		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReasonFor(body))
+	case upstream.ErrModelParamInvalid:
+		// 11133「模型供应商拒绝请求参数」：请求级错误，同一 body 换任何账号都被同一处
+		// 拒绝。零动作（不冷却/不熔断/不 NoteError），chatCompletions 已 fail-fast
+		// 400 透传原文、终止轮转。
+	case upstream.ErrToolMismatch:
+		// 11148 工具配对断裂：请求内容级错误（上游明示「直接重试无效，请新建任务」）。
+		// 零动作，chatCompletions 已 fail-fast 400 透传原文、终止轮转。
+	case upstream.ErrUpstreamBusy:
+		// 6020/6021 渠道级排队/队列满：上游容量信号，不是账号问题。零动作，
+		// chatCompletions 已 fail-fast 503 + Retry-After 透传原文、终止轮转。
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →

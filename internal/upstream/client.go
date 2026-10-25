@@ -42,6 +42,9 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrModelParamInvalid             // 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、max_tokens 过小等）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满 → 上游容量信号：不罚号、不轮转，末端 503 透传原文
+	ErrToolMismatch                  // 11148「tool calls and tool results do not match」→ 请求内容级配对断裂：不罚号、不轮转，末端 400 透传原文
 )
 
 func (k ErrKind) String() string {
@@ -72,6 +75,12 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrClient:
 		return "client"
+	case ErrModelParamInvalid:
+		return "model_param_invalid"
+	case ErrUpstreamBusy:
+		return "upstream_busy"
+	case ErrToolMismatch:
+		return "tool_mismatch"
 	default:
 		return "none"
 	}
@@ -208,10 +217,25 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
+// modelRateLimitCodes 明确指向「模型级限流」的业务 code 族：
+//   - 6004：该模型额度/用量被节流，msg 带「将在 … 重置」（有权威恢复时刻，issue #31）；
+//   - 14003 RateLimitError：官方文案「当前模型请求繁忙，请切换模型或稍后重试」。
+//     同号换模型立刻可用，属瞬时繁忙（无墙钟），由 pool 的模型繁忙短窗单独处置。
+//
+// 两者都只说明「这个模型此刻受限」，账号本身健康，不能按账号级冷却。
+const modelRateLimitCodes = "6004|14003"
+
+// modelBusyCode「当前模型请求繁忙」的业务 code（modelRateLimitCodes 的子集）。
+// 与 6004 分开是对的：6004 带额度窗口（可对齐上游墙钟），14003 只能短窗退避。
+const modelBusyCode = "14003"
+
+// modelUsageLimitCode 上游「用量频率限制」的业务码（实测出现在 kimi 系模型）。
+// 与 6004 同属模型级，但 code 不同：只凭 code 放宽会把账号级 6000 也误判成模型级，
+// 故要求文案同时命中 modelSwitchModelHint 才按模型级处理。
+const modelUsageLimitCode = "6000"
+
+// modelSwitchModelHint 官方在模型级用量限流答复里给出的换模型提示语。
+const modelSwitchModelHint = "切换其他模型"
 
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
@@ -222,7 +246,9 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + modelRateLimitCodes + `)"?`)
+	reModelUsageLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelUsageLimitCode + `"?`)
+	reModelBusy       = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -230,50 +256,89 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
+// IsModelRateLimit 报告 body 是否明确指向模型级限流（业务 code 6004 / 14003，
+// 或 code 6000 且带官方「切换其他模型」提示）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	return reModelRateLimit.MatchString(body)
+	if reModelRateLimit.MatchString(body) {
+		return true
+	}
+	// 6000 需要文案佐证：官方在「单模型用量超限」时会写「您也可以切换其他模型继续使用」，
+	// 真正的账号级限制不会这么提示。只凭 code 放宽会把整号受限误判成模型级。
+	return reModelUsageLimit.MatchString(body) && strings.Contains(body, modelSwitchModelHint)
+}
+
+// IsModelBusy 报告 body 是否是「模型繁忙」(code 14003)。
+//
+// 与 6004 的区别：6004 是额度窗口用满，带「将在 … 重置」的权威恢复时刻；14003 只是
+// 瞬时繁忙，body 里没有任何时间。前者按上游墙钟停车，后者只能短窗口退避——套用
+// soft_rate（600s 起、翻倍到 2h）会把一次抖动放大成整池十分钟不可用。
+func IsModelBusy(body string) bool {
+	return reModelBusy.MatchString(body)
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
 
-// modelBlockMsgMarker 11102 答复的确定性文案（官方 error message 固定短语）。
-// 只收这个窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的
+// modelForbiddenCode 明确指向「该账号类型无权使用该模型」的业务 code。
+// 同一模型在不同账号类型上权限不同，因此与 11102 同属 (账号, 模型) 级负缓存：
+// 换有权限的账号仍可能成功，全部账号都拒绝时再向客户端报模型不可用。
+const modelForbiddenCode = "11158"
+
+// modelForbiddenMsgMarker 11158 的确定性文案（官方 error message 固定短语）。
+const modelForbiddenMsgMarker = "is not allowed for user type"
+
+// modelBlockMsgMarkers 11102/14401 答复的确定性文案（官方 error message 固定短语）。
+// 只收这些窄短语，不收 "model ... not found" 宽正则——后者会误伤其他业务的
 // not found 措辞。
-const modelBlockMsgMarker = "service info not found"
+var modelBlockMsgMarkers = []string{"service info not found", "route config not found"}
 
 // ModelBlockReason 11102 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
 // handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11102" 前缀识别条目
 // （与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
 const ModelBlockReason = "11102 model not available"
 
-// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 的确定性答复。
+// ModelForbiddenReason 11158 负缓存条目的 reason 前缀（与 11102 分开，便于区分原因）。
+const ModelForbiddenReason = "11158 model not allowed for account type"
+
+// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 或「该账号类型无权使用」
+// (11158) 的确定性答复。
 //
 // 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
 // 拿整段文本匹配会把 "11102" 撞在 ID 上、误避让一个本来能用的模型。判定 =
-// code 字段精确等于 "11102"，或 msg/message 字段命中窄短语 "service info not
-// found"（两者任一命中即真）。只看 400/404：429 带 11102 属限流语义。
+// code 字段精确等于 11102/11158，或 msg/message 字段命中窄短语（两者任一命中即真）。
+// 只看 400/404：429 带这些码属限流语义。
 // 字段遍历覆盖顶层与 error 子对象两层。
 func IsModelBlocked(status int, body string) bool {
 	if (status != http.StatusBadRequest && status != http.StatusNotFound) || body == "" {
 		return false
 	}
-	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
-	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
+	// 轻量预检：body 无相关 code 也无 marker 时直接短路（大多数 4xx 零分配返回）。
+	lower := strings.ToLower(body)
+	if !strings.Contains(body, modelBlockCode) && !strings.Contains(body, modelForbiddenCode) &&
+		!containsAnyMarker(lower, modelBlockMsgMarkers) && !strings.Contains(lower, modelForbiddenMsgMarker) {
 		return false
 	}
+	code, msg := modelBlockFields(body)
+	if code == modelBlockCode || code == modelForbiddenCode {
+		return true
+	}
+	lowerMsg := strings.ToLower(msg)
+	return containsAnyMarker(lowerMsg, modelBlockMsgMarkers) ||
+		strings.Contains(lowerMsg, modelForbiddenMsgMarker)
+}
+
+// modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
+func modelBlockFields(body string) (code, msg string) {
 	var root map[string]any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
-		return false
+		return "", ""
 	}
 	nodes := []map[string]any{root}
 	if inner, ok := root["error"].(map[string]any); ok {
 		nodes = append(nodes, inner)
 	}
-	code, msg := "", ""
 	for _, node := range nodes {
 		for _, key := range []string{"code", "errCode", "error_code"} {
 			if v, ok := node[key]; ok && v != nil && code == "" {
@@ -286,10 +351,27 @@ func IsModelBlocked(status int, body string) bool {
 			}
 		}
 	}
-	if code == modelBlockCode {
-		return true
+	return code, msg
+}
+
+// ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason：
+// 11158 是账号类型权限问题，其余已由 IsModelBlocked 确认的形态沿用 11102。
+func ModelBlockReasonFor(body string) string {
+	code, msg := modelBlockFields(body)
+	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
+		return ModelForbiddenReason
 	}
-	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+	return ModelBlockReason
+}
+
+// containsAnyMarker 任一短语命中即真（文案判定统一走这里，避免各处各写一遍循环）。
+func containsAnyMarker(lower string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
@@ -340,6 +422,23 @@ func hasBusinessEnvelope(body string) bool {
 // 403 含 accountFault 文案的维持现状（ErrAccountFault），由 Classify 的规则序保证。
 func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
+// IsGatewayUnauthorized 报告 401 是否为**网关层**（APISIX/openresty）拒绝。
+//
+//	HTTP/1.1 401
+//	WWW-Authenticate: Bearer realm="copilot", error="invalid_token", error_description="invalid token"
+//	Server: APISIX/3.9.1
+//	<body><html><head><title>401 Authorization Required</title>…openresty…</body>
+//
+// 与 403 WAF 页同族：都是边缘拦下来的 HTML 页，没有 `{"code":…}` 信封。业务层 401
+// 一定带信封（如 code 12153 offline session），走既有 sessionDeadMarkers。
+// 判为 ErrSessionDead 的依据是实测：同一 token 在 /v3/config 仍 200、在 /v2/* 全 401，
+// 且 refresh 端点对该 token 回 invalid_grant——即「session 已被上游作废，只能重登」，
+// 不是请求头/UA/请求格式问题（同批健康号用完全相同的一套头仍 200）。
+// 落 ErrClient（旧行为）的代价是「只换号不罚」：死号永远留在池里，每个请求都再打一遍。
+func IsGatewayUnauthorized(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
 }
 
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
@@ -518,6 +617,14 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
 		return ErrHardCredit
 	}
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：上游
+	// 容量信号，不是账号限流。判在 429 兜底之前——按 ErrSoftRate 罚号会与全冷却兜底
+	// 互相喂（兜底把冷却号再送上游，再撞又续订 600s），把几秒的排队放大成整段时间
+	// 全量 429。任意状态码都认（防上游换状态码）；结构化 code 主判，requestId 等
+	// 字段恰好含 "6020"/"6021" 不误伤（hasBusinessCode 只认 "code": 键）。
+	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") {
+		return ErrUpstreamBusy
+	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
 	// ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词更权威的
@@ -547,6 +654,14 @@ func Classify(status int, body string) ErrKind {
 			}
 		}
 	}
+	// 11148「tool calls and tool results do not match」：**请求内容**级配对断裂（上游
+	// 明示「直接重试无效，请新建任务」）。不在此分流会落 ErrClient → 全池轮转一遍
+	// （每个健康号白记一笔连败）+ 末端 503，而同一 body 换任何账号都是同样的 400。
+	// 判在状态码兜底（404/5xx）之前——上游可能套 5xx 外壳；codeMarker 走空白容差。
+	if codeMarker(lower, "11148") || strings.Contains(lower, "tool results do not match") ||
+		strings.Contains(body, "工具调用与工具结果不匹配") {
+		return ErrToolMismatch
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
@@ -560,6 +675,12 @@ func Classify(status int, body string) ErrKind {
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
 	}
+	// 网关 401（APISIX/openresty HTML 页，无业务信封）：token 被上游判无效。
+	// 实测同 token 在 /v3/config 仍 200、在 /v2/* 全 401，refresh 回 invalid_grant
+	// ⇒ session 已被作废，只能重登。见 IsGatewayUnauthorized。
+	if IsGatewayUnauthorized(status, body) {
+		return ErrSessionDead
+	}
 	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
 	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
 	// 11135 业务码走 codeMarker（JSON 空白容差），文案走 invalidImageMarkers。
@@ -572,6 +693,16 @@ func Classify(status int, body string) ErrKind {
 				return ErrImageInvalid
 			}
 		}
+	}
+	// 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、参数形态与
+	// 该模型版本不符等）与 11135 同族：确定性请求级错误，同一 body 换任何账号都会被
+	// 同一处拒绝（上游 GPT 系 max_tokens<16 → 400 code=11133，「全号轮转同样被拒」）。
+	// 不在此分流会落 ErrClient → 全池轮转一遍后末端 503，把必然失败的请求报成
+	// "账号不可用、稍后重试"（客户端于是无限重试），且每个无效请求白打一轮上游。
+	// 判定复用 hint.go 的 isModelParamInvalid（code 11133 / model_param_invalid 文案，
+	// JSON 空白容差），不写第二份词表。
+	if status == http.StatusBadRequest && isModelParamInvalid(body) {
+		return ErrModelParamInvalid
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。

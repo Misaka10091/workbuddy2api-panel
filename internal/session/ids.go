@@ -56,6 +56,46 @@ func NewMessageID() string {
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
 }
 
+// NewConversationID 生成会话级标识：UUID v4 带横线（36 字符），对齐官方客户端
+// X-Conversation-ID 的实测形态。
+//
+// 使用边界：**只给「网关自己发起的会话」**用（自动化任务上报体、面板批量动作等）。
+// 真实用户会话必须优先透传客户端声明的 conversationId——伪造会破坏后台按对话聚合。
+func NewConversationID() string {
+	var u [16]byte
+	if _, err := cryptorand.Read(u[:]); err != nil {
+		return NewMessageID() // 熵源故障兜底：仍是合法 ID（形态退让，不 panic）
+	}
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// NewTraceID 生成链路 trace ID：32 hex，**纯随机、不带时间位**。
+//
+// 与 NewMessageID 的区别是故意的：官方真机抓包里 X-Trace-ID / X-B3-TraceId 恒为
+// 纯随机值，而同一请求的 X-Request-ID 才带时间位。两者都掺时间位就成了一种官方
+// 没有的规律（issue #51：标识形态本身就是指纹）。
+func NewTraceID() string {
+	b := make([]byte, 16)
+	if _, err := cryptorand.Read(b); err != nil {
+		return NewMessageID()
+	}
+	return hex.EncodeToString(b)
+}
+
+// NewSpanID 生成 16 hex 的链路 span ID，同样纯随机。
+//
+// 不能拿 messageID[:16] 顶替：messageID 带时间位，切片后 span 也会带上，而官方
+// span 与 trace、request 均无关系。
+func NewSpanID() string {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		return fmt.Sprintf("%016x", uint64(rand.Uint64())|1)
+	}
+	return hex.EncodeToString(b)
+}
+
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
 // 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
 // 结束，不构成断档）。会话级（RequestIDForKey）与轮级（TurnRequestID）共用同一盐。

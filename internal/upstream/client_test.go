@@ -56,8 +56,9 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 11133「模型供应商拒绝请求参数」与 11135 同族：确定性请求级错误，
+		// 同一 body 换任何账号都被同一处拒绝 → ErrModelParamInvalid（不轮转、不罚号）。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrModelParamInvalid},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -109,6 +110,23 @@ func TestClassify(t *testing.T) {
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
+		// 6020 排队 / 6021 队列满：渠道级容量信号，不是账号限流——按 soft_rate 罚号
+		// 会与全冷却兜底互相喂，把几秒排队放大成整段时间全量 429。
+		{429, `{"code":6020,"msg":"queue.waiting.title","requestId":"01a16e3d95b4a000e3385c807c"}`, ErrUpstreamBusy},
+		{429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`, ErrUpstreamBusy},
+		// 结构化 code 之外的字段（requestId）不得误命中。
+		{429, `{"code":9999,"msg":"x","requestId":"6021"}`, ErrSoftRate},
+		// 11148 工具配对断裂：请求内容级错误，换号同样 400。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolMismatch},
+		{400, `{"code": 11148, "msg":"x"}`, ErrToolMismatch},
+		// 网关 401（APISIX HTML 页，无业务信封）：token 被上游作废，只能重登。
+		{401, `<html><head><title>401 Authorization Required</title></head><body>openresty</body></html>`, ErrSessionDead},
+		{401, ``, ErrSessionDead},
+		// 业务层 401 带信封（非 12153）仍按既有语义走 ErrClient。
+		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 11158 账号类型无权使用该模型：与 11102 同属 (账号,模型) 负缓存。
+		{404, `{"code":11158,"msg":"model gpt-5.6-sol is not allowed for user type"}`, ErrModelBlocked},
+		{400, `{"code": 11158, "msg":"x"}`, ErrModelBlocked},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -126,6 +144,12 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 6004：模型级限流（issue #31 的核心场景）。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		// 14003「当前模型请求繁忙」同属模型级（同号换模型立刻可用）。
+		{`{"code":14003,"msg":"当前模型请求繁忙，请切换模型"}`, true},
+		{`{"code": 14003,"msg":"x"}`, true},
+		// 6000 必须有官方「切换其他模型」提示才按模型级——只凭 code 会把账号级放宽。
+		{`{"code":6000,"msg":"您也可以切换其他模型继续使用"}`, true},
+		{`{"code":6000,"msg":"usage frequency limited"}`, false},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
@@ -133,6 +157,48 @@ func TestIsModelRateLimit(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 14003「模型繁忙」独立判据（与 6004 分开：无权威恢复时刻）。
+func TestIsModelBusy(t *testing.T) {
+	if !IsModelBusy(`{"code":14003,"msg":"当前模型请求繁忙"}`) {
+		t.Error("14003 应判为模型繁忙")
+	}
+	if IsModelBusy(`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`) {
+		t.Error("6004 是额度窗口，不是瞬时繁忙")
+	}
+	if IsModelBusy(`{"code":14001,"msg":"quota exhausted"}`) {
+		t.Error("14001 是额度耗尽，不是繁忙")
+	}
+}
+
+// TestModelBlockReasonFor 11102/11158 的负缓存 reason 必须分开，便于区分原因。
+func TestModelBlockReasonFor(t *testing.T) {
+	if got := ModelBlockReasonFor(`{"code":11158,"msg":"not allowed for user type"}`); got != ModelForbiddenReason {
+		t.Errorf("11158 reason=%q want %q", got, ModelForbiddenReason)
+	}
+	if got := ModelBlockReasonFor(`{"code":11102,"msg":"service info not found"}`); got != ModelBlockReason {
+		t.Errorf("11102 reason=%q want %q", got, ModelBlockReason)
+	}
+}
+
+// TestIsGatewayUnauthorized 网关 401 判据绑定「401 + 无业务信封」。
+func TestIsGatewayUnauthorized(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{401, `<html><body>401 Authorization Required</body></html>`, true},
+		{401, ``, true},
+		{401, `{"code":12153,"msg":"Offline user session not found"}` , false},
+		{403, `<html>403</html>`, false},
+	}
+	for _, c := range cases {
+		if got := IsGatewayUnauthorized(c.status, c.body); got != c.want {
+			t.Errorf("IsGatewayUnauthorized(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
 	}
 }

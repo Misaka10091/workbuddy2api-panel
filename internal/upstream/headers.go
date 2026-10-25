@@ -185,9 +185,12 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
+	ConversationID        string // X-Conversation-ID：body 提取的入站值
 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	TraceID               string // X-Trace-ID：入站透传值，空则独立新值（不回落 request id）
+	// CacheKeyID 网关派生的粘性会话键（客户端未声明会话时的会话头族来源）。
+	// 与 prompt_cache_key 同源，保证「同一客户端会话在不同账号上」各用独立缓存槽。
+	CacheKeyID string
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -236,8 +239,11 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
-	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
-	c.injectConversationHeaders(req, meta)
+	// 客户端 SDK 指纹族（x-stainless-* / x-agent-*）：官方 chat 出站恒发，
+	// 缺这段上游看到的是一份残缺头集合（形态可判别）。
+	c.injectClientSDKHeaders(req)
+	// 会话头族（对话/请求/消息/B3 链路 + acp-connection-id），见 injectConversationHeaders。
+	c.injectConversationHeaders(req, a.UID, meta)
 }
 
 // injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
@@ -255,18 +261,28 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 }
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
-// 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//
+// **三件套齐全**是渠道校验的一部分：上游要求 X-Conversation-ID /
+// X-Conversation-Request-ID / X-Conversation-Message-ID 同时在场，缺任一头即
+// HTTP 400 code=11-128「conversation id missing」（官方 chat/speech 都带）。
+// 因此 X-Conversation-ID 不再「空则不发」——客户端没声明就按会话键补，连会话概念
+// 都没有的调用方（夜猫子对话/面板任务）现造一个，绝不留给上游缺失形态。
+//
+// 头族分层：
+//   - X-Conversation-ID：会话级，多轮稳定。客户端声明值优先 → 会话键（与
+//     prompt_cache_key 同源，含账号隔离段）→ 现造 36 字符 UUID v4。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
-//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
+//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
 //   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
-//   - X-Trace-ID：入站透传或 = conversationRequestID。
-//   - X-B3-TraceId / X-B3-SpanId / X-B3-Sampled：链路族。B3 规范只认 16/32 hex
-//     TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId 回落
-//     messageID（恒 32 hex），SpanId 取 messageID[:16]（每消息新）。
-func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+//   - X-Trace-ID：入站透传，否则独立新值（**不**回落 conversationRequestID——
+//     官方实测两族恒不相等）。
+//   - X-B3-TraceId / SpanId / ParentSpanId / Sampled：链路族，TraceId 跟随
+//     X-Trace-ID；SpanId/ParentSpanId 必须独立随机（拿 messageID 切片会带出时间位）。
+//   - b3 / traceparent：官方两版都双发（缺它们的头集合在形态上可区分）。
+//   - acp-connection-id：官方列进标准出站头族，按「同 (账号, 会话) 稳定、与会话 ID
+//     不同值」派生。
+func (c *Client) injectConversationHeaders(req *http.Request, uid string, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
@@ -274,25 +290,83 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		convReqID = session.NewMessageID()
 	}
 	messageID := session.NewMessageID()
+	src := cacheKeySource(meta)
 	if meta.ConversationID != "" {
 		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+	} else if src != "" {
+		// 客户端没声明会话：用与 prompt_cache_key 同源的 uid 隔离键填该头。
+		// 不带 uid 段的话，同一客户端会话打在不同账号上会共用同一个上游缓存槽。
+		req.Header.Set("X-Conversation-ID", buildCacheKey(uid, src))
+	} else {
+		// 无会话概念的调用方：头族是渠道校验的一部分，缺任一头即 400 11-128，
+		// 故现造一个（该路径无会话状态，不必跨请求稳定）。
+		req.Header.Set("X-Conversation-ID", session.NewConversationID())
 	}
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
 	req.Header.Set("X-Root-Request-ID", convReqID)
+	// X-Trace-ID 与 request id **互不回落**：真机实测两族恒不相等，回落会让两族头
+	// 恒等，成为「网关自造」的可见痕迹。入站透传值仍优先。
 	traceID := meta.TraceID
 	if traceID == "" {
-		traceID = convReqID
+		traceID = session.NewTraceID()
 	}
 	req.Header.Set("X-Trace-ID", traceID)
-	b3Trace := convReqID
+	// B3 跟着 trace 走；非法（含横线/超长/非 hex）时回落恒 32 hex 的 messageID。
+	b3Trace := traceID
 	if !validTraceID(b3Trace) {
-		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
+		b3Trace = messageID
 	}
 	req.Header.Set("X-B3-TraceId", b3Trace)
-	req.Header.Set("X-B3-SpanId", messageID[:16])
+	// SpanId / ParentSpanId 必须独立随机：官方 span 与 trace/request 均无关系。
+	spanID := session.NewSpanID()
+	parentSpanID := session.NewSpanID()
+	req.Header.Set("X-B3-SpanId", spanID)
+	req.Header.Set("X-B3-ParentSpanId", parentSpanID)
 	req.Header.Set("X-B3-Sampled", "1")
+	// 单头 B3 与 W3C traceparent：官方两版都双发。
+	req.Header.Set("b3", b3Trace+"-"+spanID+"-1-"+parentSpanID)
+	req.Header.Set("traceparent", "00-"+b3Trace+"-"+spanID+"-01")
+	// acp-connection-id：同 (账号, 会话) 稳定、与会话 ID 不同值（官方两个值不同但
+	// 都按会话稳定）。无会话源时现造一个。
+	if src != "" {
+		req.Header.Set("acp-connection-id", buildStableUUID(uid, src, "acp"))
+	} else {
+		req.Header.Set("acp-connection-id", session.NewConversationID())
+	}
+}
+
+// 官方 chat 出站的自报 SDK 指纹（国际版与国内版真机实测**完全一致**）。
+//
+// 这些是 openai-node SDK 自动加的 x-stainless-* 头 + 业务语义头 x-agent-type/intent。
+// 网关是 Go 实现，没有对应的 SDK 运行时；这里按官方实测值固定，理由是「客户端形态
+// 一致性」优先——不发这几个头，上游看到的是一份缺了 SDK 段的残缺头集合。
+// 一旦客户端版本变化（package-version / node 版本），这几个常量需要跟着更新。
+const (
+	clientArch     = "x64"
+	clientOS       = "Windows"
+	clientLang     = "js"
+	clientRuntime  = "node"
+	clientNodeVer  = "v22.21.1"
+	clientSDKVer   = "6.25.0"
+	agentTypeMain  = "main"
+	agentIntentCrf = "craft"
+)
+
+// injectClientSDKHeaders 注入 x-stainless-* 与 x-agent-* 两族出站头。
+// 仅在 chat 路径调用（ChatHeaders）——billing / checkin 等 REST 域没有真机对照证据，
+// 不臆造。
+func (c *Client) injectClientSDKHeaders(req *http.Request) {
+	req.Header.Set("X-Agent-Type", agentTypeMain)
+	req.Header.Set("X-Agent-Intent", agentIntentCrf)
+	req.Header.Set("X-Stainless-Lang", clientLang)
+	req.Header.Set("X-Stainless-Package-Version", clientSDKVer)
+	req.Header.Set("X-Stainless-OS", clientOS)
+	req.Header.Set("X-Stainless-Arch", clientArch)
+	req.Header.Set("X-Stainless-Runtime", clientRuntime)
+	req.Header.Set("X-Stainless-Runtime-Version", clientNodeVer)
+	req.Header.Set("X-Stainless-Retry-Count", "0")
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。

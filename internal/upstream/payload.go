@@ -10,6 +10,99 @@ import (
 	"strings"
 )
 
+// SplitRealmPrefix 解析网关的 realm 前缀协议（"[realm:]model"）：
+// 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm 回落 "cn"。
+// 大小写敏感（前缀必须是精确的小写枚举）。server.resolveModel 与本函数同口径，
+// 保证选号、粘性、出站重写三处一致。
+func SplitRealmPrefix(model string) (realm, bare string) {
+	if i := strings.IndexByte(model, ':'); i >= 0 {
+		switch model[:i] {
+		case "cn", "global":
+			return model[:i], model[i+1:]
+		}
+	}
+	return "cn", model
+}
+
+// normalizeModelName 把出站 model 剥成裸名：WorkBuddy 上游只认裸名，realm 前缀是
+// 网关侧路由协议。model 缺失或非字符串时保持原样（不二次错误化坏 body）。
+//
+// 必须最先执行：后续 injectThinking / normalizeReasoningEffort / 目录补 max_tokens
+// 都按裸模型名查表，晚一步就查空（前缀透传还会被上游当未知模型）。
+func normalizeModelName(obj map[string]any) {
+	cur, ok := obj["model"].(string)
+	if !ok {
+		return
+	}
+	if _, bare := SplitRealmPrefix(cur); bare != cur {
+		obj["model"] = bare
+	}
+}
+
+// normalizeStop 把字符串形态的 stop 归一为数组。
+//
+// OpenAI 兼容两种写法（"stop": "\n\n" 与 ["\n\n"]），WorkBuddy 上游只认数组：
+// 透传字符串会 HTTP 400 code=11101（Unmarshal chat params failed），进而整池轮换
+// 后 503 —— 客户端一个字段写法就换来「账号不可用」。
+func normalizeStop(obj map[string]any) {
+	s, ok := obj["stop"].(string)
+	if !ok {
+		return
+	}
+	obj["stop"] = []string{s}
+}
+
+// dropReasoningContentParts 剔除 chat content 数组里的 reasoning_text / reasoning 片段。
+//
+// 场景：第三方转发的 responses→chat 转换器会把助手历史里的思考片段原样透传进
+// /v1/chat/completions；上游 content 类型白名单不含它，命中即 HTTP 400 code=11101
+// 「unsupported content type at index 0: reasoning_text」。思考片段只是模型私有推理，
+// 下游续写不需要，剔除无副作用：
+//   - 删除 type 为 reasoning_text / reasoning 的片段（TrimSpace 后比较）
+//   - 删除后 content 为空且该消息无 tool_calls → 整条消息一并删除；有 tool_calls 则保留
+//     （留空数组，避免破坏工具调用配对）
+func dropReasoningContentParts(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	out := make([]any, 0, len(msgs))
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			out = append(out, rawMsg)
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			out = append(out, rawMsg) // 字符串 content（或字段缺失）不受影响
+			continue
+		}
+		kept := make([]any, 0, len(parts))
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				kept = append(kept, rawPart)
+				continue
+			}
+			ptype, _ := part["type"].(string)
+			switch strings.TrimSpace(ptype) {
+			case "reasoning_text", "reasoning":
+				continue
+			}
+			kept = append(kept, rawPart)
+		}
+		if len(kept) == 0 {
+			if _, hasToolCalls := msg["tool_calls"]; !hasToolCalls {
+				continue // 整条只剩思考片段：删掉，否则上游会为这条空 content 报错
+			}
+		}
+		msg["content"] = kept
+		out = append(out, rawMsg)
+	}
+	obj["messages"] = out
+}
+
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
@@ -35,6 +128,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if err := json.Unmarshal(src, &obj); err != nil {
 		return src
 	}
+	// 先剥 realm 前缀：后续 clampGPTMinMaxTokens / injectThinking /
+	// normalizeReasoningEffort 都按裸模型名查表，晚一步就会查空。
+	normalizeModelName(obj)
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
 	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
@@ -52,6 +148,10 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	// stop 字符串形态归一为数组（上游只认数组，字符串会 400 code=11101）。
+	normalizeStop(obj)
+	// 剔除 content 数组里的 thinking/reasoning 片段（上游类型白名单不含，命中即 11101）。
+	dropReasoningContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
