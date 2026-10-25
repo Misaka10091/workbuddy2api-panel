@@ -829,6 +829,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// vetoedStreamFrame 记录本次是否因「首帧即 error 帧」而否决过上游流。
+	// 这类失败在观测上属于 stream_error（上游流级失败），不该被末端洗成 http_error。
+	vetoedStreamFrame := false
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
@@ -1338,6 +1341,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
 		// 记成健康、粘性把会话钉死在它身上，后续每一轮都打同一个限流号。
 		if peek.Stream {
+			// 首帧否决（零字节换号）：上游对限流/内容拦截/审核失败会「先 200 开流、
+			// 再把错误作为第一帧 error 事件发下来」。此刻还一个字节都没写给客户端——
+			// 否决这一号换下一个，客户端拿到的是真实错误码或另一号的成功流；否则
+			// 只能发 200 + error 帧，很多客户端把它当「空成功」，既不重试也不报错。
+			if payload, rest, perr := upstream.PeekFirstDataEvent(rc); perr == nil && payload != "" {
+				if kind := upstream.FrameKind(payload); kind != upstream.ErrNone {
+					_ = rc.Close()
+					h.applyErrorPolicy(acct.UID, kind, payload, bareModel, nil)
+					// 把帧内容挂在 lastErr 上：轮转若耗尽，客户端应拿到**上游原文**
+					// （含 code/requestId），而不是笼统的 no_healthy_account。
+					lastErr = &upstream.Error{Kind: kind, Status: http.StatusOK, Msg: payload}
+					vetoedStreamFrame = true
+					log.Printf("WARN: [server] stream acct=%s model=%s: first frame is an error frame kind=%s (vetoed before any byte written, rotating) payload=%s",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(payload, 200))
+					if !rotateBackoff(i, r.Context()) {
+						break
+					}
+					continue
+				}
+				// 首帧是正常内容：把已读字节回放回去，下游解析器看到完整流。
+				rc = &readerWithCloser{Reader: rest, Closer: rc}
+			}
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
@@ -1609,6 +1634,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if retryAfterSec > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSec))
 	}
+	// 首帧否决导致轮转耗尽时，成因在上游流而不是「池里没号」：code 也要如实反映，
+	// 否则客户端/运维会把「上游流级失败」读成调度问题（message 已是上游原文）。
+	if vetoedStreamFrame && code == "no_healthy_account" {
+		code = "upstream_stream_error"
+	}
 	if quotaCode != 0 {
 		writeModelQuotaError(w, quotaCode, msg, hint)
 	} else {
@@ -1616,6 +1646,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+	if vetoedStreamFrame {
+		// 上游流级失败（首帧否决且轮转耗尽）：客户端拿到的是错误响应，但成因在上游
+		// 流，不该被洗成 http_error 混进「网关自身 HTTP 问题」的统计。
+		st.outcome = reqlog.OutcomeStreamError
+	}
 }
 
 // maxRetryAfterSec Retry-After 上报上限（秒，10 分钟）。客户端普遍把该头当成
