@@ -1497,6 +1497,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusServiceUnavailable
 	code := "no_healthy_account"
 	msg := "all accounts are temporarily unavailable, please retry later"
+	// quotaCode 非 0 时用「上游业务码」形态回 429（见 modelBlockAllQuota）：
+	// 额度窗口内重试必然同样失败，客户端该按额度语义处置，而不是当服务端过载重试。
+	quotaCode := 0
 	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
 	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
 	if errors.Is(lastErr, errUpstreamTimeout) {
@@ -1541,31 +1544,134 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// 模型级阻塞覆盖上面的通用文案（放在最后 = 优先级最高）。
 	//
-	// 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的
-	// 上游原因，已在 hint 里原样带出，所以覆盖 message 不会丢掉上游信息，反而补上
-	// 了上游不会告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
+	// 三种「全池该模型被挡」的处置必须分开——客户端的正确反应完全不同：
+	//   - 14003 模型繁忙 → **可重试**：503 + Retry-After + code=model_busy（等就有效）；
+	//   - 6004/6000 用量配额 → **不可重试**：429 + 上游业务码，且**不发 Retry-After**
+	//     （重置前重试必然同样失败；而客户端普遍把该头当「睡多久」的指令，把几十分钟
+	//     的冷却原样报出去等于让客户端静默挂起，比报错更难排查）；
+	//   - 11102/11158 确定性拒绝 → 400 model_unavailable（换号重试必然同样失败，
+	//     换模型才有用）。
 	//
-	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
-	// 换号重试必然同样失败，客户端不该按可重试错误处理。
+	// 此前一律回 400 model_unavailable：客户端据此判定「模型被杀、重试无意义」，
+	// 高峰期表现为「模型用不了」，而官方客户端同一时刻还在排队等结果。
+	retryAfterSec := 0
 	if modelBlock.Blocked {
-		code = "model_unavailable"
-		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
-		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
-		if !upstreamMsgPassed {
-			msg = "model is unavailable on every account (per-model cooldown), try another model"
+		switch {
+		case modelBlockAllQuota(modelBlock):
+			status = http.StatusTooManyRequests
+			quotaCode = modelQuotaCode(modelBlock.Reason)
+			code = ""
+			if !upstreamMsgPassed {
+				msg = "model usage limit reached on every account; retry after the quota window resets"
+			}
+			hint = fmt.Sprintf("model_quota: %d account(s) hit this model's usage limit", modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				hint += "; resets at " + modelBlock.Until.Format(time.RFC3339)
+			}
+		case modelBlockIsTransient(modelBlock.Reason):
+			code = "model_busy"
+			status = http.StatusServiceUnavailable
+			if !upstreamMsgPassed {
+				msg = "model is temporarily busy on every account (per-model cooldown); retry after the cooldown window"
+			}
+			hint = fmt.Sprintf("model_busy: %d account(s) cooling down this model", modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				if d := time.Until(modelBlock.Until); d > 0 {
+					// 向上取整：客户端按秒睡眠，向下取整会提前醒来再次撞墙。
+					secs := int(d.Seconds()) + 1
+					if secs > maxRetryAfterSec {
+						secs = maxRetryAfterSec
+					}
+					retryAfterSec = secs
+					hint += fmt.Sprintf("; earliest unblock in %ds", secs)
+				}
+			}
+			if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+				hint += "; upstream: " + s
+			}
+		default:
+			code = "model_unavailable"
+			// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
+			// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
+			if !upstreamMsgPassed {
+				msg = "model is unavailable on every account (per-model cooldown), try another model"
+			}
+			hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
+			}
+			if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+				hint += "; upstream: " + s
+			}
+			status = http.StatusBadRequest
 		}
-		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
-		if !modelBlock.Until.IsZero() {
-			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
-		}
-		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
-			hint += "; upstream: " + s
-		}
-		status = http.StatusBadRequest
 	}
-	writeOpenAIErrorHint(w, status, code, msg, hint)
+	if retryAfterSec > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSec))
+	}
+	if quotaCode != 0 {
+		writeModelQuotaError(w, quotaCode, msg, hint)
+	} else {
+		writeOpenAIErrorHint(w, status, code, msg, hint)
+	}
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// maxRetryAfterSec Retry-After 上报上限（秒，10 分钟）。客户端普遍把该头当成
+// 「睡多久」的指令（有实现直接 delayMs = retry-after×1000，不设上限），把几十分钟
+// 的冷却原样报出去等于让客户端静默挂起；超过上限按上限报，到点重试再拿一次 503 即可
+// （只是选号失败，不打上游）。
+const maxRetryAfterSec = 600
+
+// modelBlockAllQuota 报告「全池该模型被挡」是否纯属「用量配额」型：上游 6004/6000
+// 明说用量已超出频率限制、将在某时刻重置。这类锁在重置前重试必然同样失败，客户端
+// 该立刻报错（换模型/等额度），而不是像 14003 那样等着重试。
+//
+// 判据复用 upstream 既有分类：IsModelRateLimit 命中 6004/14003/6000，IsModelBusy
+// 只认 14003——「是模型级限流、但不是瞬时繁忙」即用量配额。锁因不是上游原文
+// （如本地标记串）时不认，保持旧的兜底行为。
+func modelBlockAllQuota(blk pool.ModelBlockStatus) bool {
+	reason := strings.TrimSpace(blk.Reason)
+	if !blk.Blocked || reason == "" {
+		return false
+	}
+	return upstream.IsModelRateLimit(reason) && !upstream.IsModelBusy(reason)
+}
+
+// modelQuotaCode 返回锁因里的用量配额业务码：6000（kimi 系「用量频率限制」，带换模型
+// 提示）与 6004（「使用量已超出频率限制」）同族不同码，按原文区分；识别不到按 6004。
+func modelQuotaCode(reason string) int {
+	if upstream.HasCodeMarker(reason, "6000") {
+		return 6000
+	}
+	return 6004
+}
+
+// modelBlockIsTransient 判断模型级冷却的原因是「暂时忙」还是「确定性拒绝」。
+// 瞬时（可重试）只有 14003；6004/6000 的配额已先被 modelBlockAllQuota 分流。
+func modelBlockIsTransient(reason string) bool {
+	return upstream.IsModelBusy(reason)
+}
+
+// writeModelQuotaError 用「上游业务码」形态回 429。
+//
+// code 为数字（6004/6000）而不是字符串：上游自己就是这样回的，客户端解析「额度
+// 超限」时会读这个数值码；同时把结构化错误信封也填上，两种解析方式都能读到。
+func writeModelQuotaError(w http.ResponseWriter, quotaCode int, msg, hint string) {
+	inner := map[string]any{
+		"message": msg,
+		"type":    "quota_exceeded",
+		"code":    quotaCode,
+	}
+	if hint != "" {
+		inner["gateway_hint"] = hint
+	}
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"code":  quotaCode,
+		"msg":   msg,
+		"error": inner,
+	})
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
