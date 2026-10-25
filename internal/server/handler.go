@@ -1628,30 +1628,48 @@ const maxRetryAfterSec = 600
 // 明说用量已超出频率限制、将在某时刻重置。这类锁在重置前重试必然同样失败，客户端
 // 该立刻报错（换模型/等额度），而不是像 14003 那样等着重试。
 //
-// 判据复用 upstream 既有分类：IsModelRateLimit 命中 6004/14003/6000，IsModelBusy
-// 只认 14003——「是模型级限流、但不是瞬时繁忙」即用量配额。锁因不是上游原文
-// （如本地标记串）时不认，保持旧的兜底行为。
+// 判据同时认两种形态：pool 里存的可能是**上游 body 原文**（含 `"code":6004`），也可能
+// 是 handler 写入的**短标签**（如 "6004 model rate limit"）。只认 JSON 会在标签形态下
+// 漏判，把配额锁误报成「模型不可用」（客户端于是换号重试，白打一轮）。
+// 14003 属于「瞬时繁忙」，必须先排除（它同属模型级限流码集合）。
 func modelBlockAllQuota(blk pool.ModelBlockStatus) bool {
 	reason := strings.TrimSpace(blk.Reason)
 	if !blk.Blocked || reason == "" {
 		return false
 	}
-	return upstream.IsModelRateLimit(reason) && !upstream.IsModelBusy(reason)
+	if modelBlockIsTransient(reason) {
+		return false
+	}
+	for _, marker := range []string{"6000", "6004", "model rate limit", "rate_limit", "rate limit"} {
+		if strings.Contains(reason, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // modelQuotaCode 返回锁因里的用量配额业务码：6000（kimi 系「用量频率限制」，带换模型
 // 提示）与 6004（「使用量已超出频率限制」）同族不同码，按原文区分；识别不到按 6004。
 func modelQuotaCode(reason string) int {
-	if upstream.HasCodeMarker(reason, "6000") {
+	if strings.Contains(reason, "6000") || upstream.HasCodeMarker(reason, "6000") {
 		return 6000
 	}
 	return 6004
 }
 
 // modelBlockIsTransient 判断模型级冷却的原因是「暂时忙」还是「确定性拒绝」。
-// 瞬时（可重试）只有 14003；6004/6000 的配额已先被 modelBlockAllQuota 分流。
+//
+// 依据是写冷却时存下的 Reason（可能是上游原文，也可能是 handler 的短标签）：
+//   - 瞬时（可重试）：14003「模型繁忙」→ 等一等就好；
+//   - 不可重试：6004/6000 用量配额（上游已给出重置时刻，等到重置前都无效）；
+//   - 确定性拒绝：11102「该后端无此模型」、11158「号型不允许」→ 换模型才有用。
 func modelBlockIsTransient(reason string) bool {
-	return upstream.IsModelBusy(reason)
+	for _, marker := range []string{"14003", "model busy"} {
+		if strings.Contains(reason, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // writeModelQuotaError 用「上游业务码」形态回 429。
