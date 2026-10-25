@@ -120,7 +120,16 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
+//
+// 不含「按模型目录补 max_tokens」（maxOut 为 nil 即跳过），保持既有公开语义。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return PrepareBodyOptWithEffortsDefaultAndCaps(src, sanitize, efforts, defaultEfforts, nil)
+}
+
+// PrepareBodyOptWithEffortsDefaultAndCaps 在 …AndDefault 之上接入模型输出上限快照：
+// 无显式限额的请求按目录动态值补 max_tokens（见 injectCatalogMaxTokens）。
+// maxOut 为 nil 时行为与 …AndDefault 完全一致。
+func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -139,6 +148,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// （实测 32000），长流任务被截。
 	translateMaxCompletionTokens(obj)
 	clampGPTMinMaxTokens(obj)
+	// 目录动态值补默认输出上限：多数客户端连别名都不发（Codex 实测不带任何限额字段），
+	// 会被上游默认 32000 截断。仅当 body 没有 max_tokens 时补。
+	injectCatalogMaxTokens(obj, maxOut)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -175,7 +187,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
-	normalizeReasoningEffort(obj, efforts)
+	normalizeReasoningEffort(obj, efforts, defaultEfforts)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -264,17 +276,56 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
 //   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
-func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
-	if len(efforts) == 0 {
+// injectCatalogMaxTokens 按模型目录（maxOutputTokens）补 max_tokens。
+//
+// 为什么需要：上游对**缺失**输出限额的请求套一个保守默认（实测 32000）。不主动发
+// 限额的客户端（Codex 等）写大文件时会被无声截断——客户端拿不到任何错误，只看到
+// 输出提前结束。目录里的 maxOutputTokens 就是该模型真正的上限，按它补等于「用满」。
+//
+// 只在 body 没带 max_tokens 时补（显式限额优先，含 translateMaxCompletionTokens
+// 刚翻译出来的值）；目录里没有该模型/上限 ≤ 0 时不补（不臆造）。
+func injectCatalogMaxTokens(obj map[string]any, maxOut map[string]int64) {
+	if len(maxOut) == 0 {
+		return
+	}
+	if _, has := obj["max_tokens"]; has {
 		return
 	}
 	model, _ := obj["model"].(string)
+	if v, ok := maxOut[model]; ok && v > 0 {
+		obj["max_tokens"] = v
+	}
+}
+
+// normalizeReasoningEffort 把请求档位对齐到模型支持的档位（snake/camel 双字段兼容），
+// 返回本次最终生效的档位（未携带字段/未知模型/未知档位/模型未缓存 → ""）。
+//   - off/none/disabled → 视作「关闭思考」：删除该字段（不是可降级的档位）
+//   - 请求档位模型支持 → 原样透传
+//   - 不支持 → 取**最近**的支持档；距离相同优先模型声明的默认档，其次偏高的一档
+//   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
+//
+// 为什么不一律降级：Codex 等客户端默认发 medium，而 CN 模型常见档位是 low/high/max
+// （没有 medium）——一律取「≤ 请求档的最高档」会降到 low，比**不携带该字段**时的模型
+// 默认档 high 还弱，客户端完全无感（issue #175）。
+func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string, defaultEfforts map[string]string) string {
+	if len(efforts) == 0 {
+		return ""
+	}
+	model, _ := obj["model"].(string)
 	if model == "" {
-		return
+		return ""
+	}
+	// off/none 是「关闭思考」的表达，不是可降级的档位。没有模型声明 off 档位
+	// （effortRank 里 rank 0 的 off 只是排序占位），不截住就会被就近降级成最弱
+	// 正档——客户端要关闭，网关却给它开了最弱的思考。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+		return ""
 	}
 	supported, ok := efforts[model]
 	if !ok || len(supported) == 0 {
-		return
+		return ""
 	}
 	key := ""
 	if _, present := obj["reasoning_effort"]; present {
@@ -282,44 +333,68 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	} else if _, present := obj["reasoningEffort"]; present {
 		key = "reasoningEffort"
 	} else {
-		return
+		return ""
 	}
 	reqStr, ok := obj[key].(string)
 	if !ok {
-		return
+		return ""
 	}
 	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
 	reqIdx, known := effortRank[reqStr]
 	if !known {
-		return
+		return ""
 	}
-	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
-	best, bestIdx := "", -1
+	// 取最近档：距离最小；同距优先模型默认档，其次偏高的一档。
+	def := strings.ToLower(strings.TrimSpace(lookupDefaultEffort(defaultEfforts, model)))
+	best, bestIdx, bestDist := "", -1, 1<<30
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx <= reqIdx && idx > bestIdx {
-			best, bestIdx = s, idx
+		if !k {
+			continue
+		}
+		dist := idx - reqIdx
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist > bestDist {
+			continue
+		}
+		if dist == bestDist {
+			curDef := def != "" && strings.EqualFold(strings.TrimSpace(s), def)
+			bestDef := def != "" && strings.EqualFold(best, def)
+			switch {
+			case curDef && !bestDef: // 默认档优先
+			case curDef == bestDef && idx > bestIdx: // 同距宁高
+			default:
+				continue
+			}
+		}
+		best, bestIdx, bestDist = s, idx, dist
+	}
+	if best == "" {
+		return reqStr
+	}
+	if !strings.EqualFold(best, reqStr) {
+		obj[key] = best
+		log.Printf("reasoning_effort adjusted model=%s %s -> %s（模型支持 %s）",
+			model, reqStr, best, strings.Join(supported, ","))
+	}
+	return best
+}
+
+// effortValueOff 报告请求是否显式要求关闭思考（off / none / disabled）。
+func effortValueOff(obj map[string]any) bool {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		v, ok := obj[k].(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "off", "none", "disabled":
+			return true
 		}
 	}
-	if best != "" {
-		if !strings.EqualFold(best, reqStr) {
-			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
-		}
-		return
-	}
-	// 支持档全部高于请求档：取最低支持档。
-	lowest, lowestIdx := "", 1<<30
-	for _, s := range supported {
-		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx < lowestIdx {
-			lowest, lowestIdx = s, idx
-		}
-	}
-	if lowest != "" {
-		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
-	}
+	return false
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。

@@ -767,6 +767,11 @@ type Client struct {
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
 	modelRates map[string]map[string]string
 
+	// modelMaxOut 缓存各模型输出上限（maxOutputTokens，随模型目录刷新）。
+	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测 32000），
+	// 不发限额的客户端（Codex 等）写大文件会被无声截断。与 efforts 共用锁。
+	modelMaxOut map[string]map[string]int64
+
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
@@ -923,13 +928,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	maxOut := c.maxOutSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
+	body = PrepareBodyOptWithEffortsDefaultAndCaps(body, c.SanitizeFingerprints.Load(), efforts, defs, maxOut)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -965,6 +971,37 @@ func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+// maxOutSnapshot 返回指定 realm 的模型输出上限缓存副本；nil 表示未知（不补 max_tokens）。
+func (c *Client) maxOutSnapshot(realm string) map[string]int64 {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket, ok := c.modelMaxOut[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]int64, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
+// storeMaxOut 按 realm 写入模型输出上限缓存（maxOutputTokens），并发安全。
+// 空表时删除该 realm 桶（等价「该域无上限数据」）。
+func (c *Client) storeMaxOut(realm string, caps map[string]int64) {
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	k := realmKey(realm)
+	if len(caps) == 0 {
+		delete(c.modelMaxOut, k)
+		return
+	}
+	if c.modelMaxOut == nil {
+		c.modelMaxOut = make(map[string]map[string]int64)
+	}
+	c.modelMaxOut[k] = caps
 }
 
 // realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
@@ -1433,6 +1470,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	c.storeModelRates(a.Realm(), out)
+	// 刷新模型输出上限缓存（供出站请求体补默认 max_tokens，防上游默认值静默截断）。
+	// 与 efforts 独立：没有档位声明的模型也可能有 maxOutputTokens。
+	caps := make(map[string]int64, len(out))
+	for _, mi := range out {
+		if mi.MaxTokens > 0 {
+			caps[mi.ID] = mi.MaxTokens
+		}
+	}
+	c.storeMaxOut(a.Realm(), caps)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache := make(map[string][]string, len(out))

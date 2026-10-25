@@ -3,6 +3,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,6 +90,39 @@ func (a *Auth) RefreshTokenValue() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.RefreshToken
+}
+
+// TokenSource 解出 access token JWT 里的 token_source 声明（= 官方客户端的
+// X-Auth-Method 取值）。非 JWT / 无该声明 → ""。
+//
+// 每次现解码不缓存：RefreshToken 会整体换发 token，token_source 可能随重新授权翻转。
+// 成本是一次 base64 + 小 JSON，相对一次上游请求可忽略。
+func (a *Auth) TokenSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "token_source")
+}
+
+// jwtClaim 解出 JWT payload 里的指定字符串声明；非 JWT / 解码失败返回空。
+// 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtClaim(token, name string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return ""
+		}
+	}
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	v, _ := payload[name].(string)
+	return strings.TrimSpace(v)
 }
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。

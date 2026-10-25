@@ -4,7 +4,9 @@ package upstream
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -233,6 +235,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	} else {
 		c.injectGlobalChatHeaders(req, a)
 	}
+	// 身份头族（企业号才发；个人号零注入，见 injectIdentityHeaders）。
+	c.injectIdentityHeaders(req, a)
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
@@ -244,6 +248,46 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectClientSDKHeaders(req)
 	// 会话头族（对话/请求/消息/B3 链路 + acp-connection-id），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, a.UID, meta)
+}
+
+// injectIdentityHeaders 注入官方客户端的身份头族（X-Auth-Method / X-Userinfo）。
+//
+// 两个头都是**按账号形态条件发送**，不是常量。官方客户端等价逻辑：
+//
+//	有 enterpriseId → X-Enterprise-Id = enterpriseId（见 ChatHeaders 的企业/域分支）
+//	有 auth.method   → X-Auth-Method = method（= JWT 的 token_source 声明）
+//	→ X-Userinfo = base64(JSON{uin, owner_uin, token_source?})
+//
+// X-Userinfo 的段落是**条件拼接**：缺哪个字段就不出现在 JSON 里，而不是写空串。
+// 个人号本就没有企业这层语义——真机实测个人号出站头里这几个头都不存在，故本函数
+// 对纯个人号零注入。凭「个人号也该有 X-Userinfo」去补空值反而是伪造指纹。
+//
+// 2026-10 补充：**个人号即使 token 带 token_source 也不发**。实测 CN 设备流拿到的
+// token 声明里有 token_source: "enterprise_switch"，旧逻辑据此给个人号注入了
+// X-Auth-Method + X-Userinfo，而真机实测个人号两个头都不发——token_source 描述的是
+// token 的来路，不是账号身份。判定只看 EnterpriseID。
+func (c *Client) injectIdentityHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
+	enterprise := strings.TrimSpace(a.EnterpriseID)
+	if enterprise == "" {
+		return // 个人号：与官方客户端一致，两头全不发（不看 token_source）
+	}
+	method := a.TokenSource()
+	if method != "" {
+		req.Header.Set("X-Auth-Method", method)
+	}
+	payload := map[string]any{"uin": a.UID}
+	payload["owner_uin"] = enterprise
+	if method != "" {
+		payload["token_source"] = method
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Userinfo", base64.StdEncoding.EncodeToString(raw))
 }
 
 // injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
