@@ -1147,6 +1147,45 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
+			// 网关 401（APISIX/openresty HTML 页、无业务信封）先 refresh 求证：
+			// 「token 真失效」与「瞬时拦截」的响应完全一样，只看 401 分不出来。直接按
+			// session dead 禁号的代价是误杀健康号（实测：禁用后 revive 立刻全 200，
+			// 属瞬时间拦截累积到阈值）。
+			if kind == upstream.ErrSessionDead && upstream.IsGatewayUnauthorized(status, string(respBody)) {
+				if acctAuth := h.cfg.Pool.AuthByUID(acct.UID); acctAuth != nil && h.cfg.Upstream != nil {
+					switch h.cfg.Upstream.VerifySessionByRefresh(acctAuth) {
+					case upstream.VerifyAlive:
+						// 上游已轮换 RT：必须落盘，否则重启拿旧 RT 刷新 = 账号真死。
+						if serr := acctAuth.SaveAtomic(); serr != nil {
+							log.Printf("ERR: [server] 网关 401 后 refresh 成功但落盘失败: %v", serr)
+						}
+						h.cfg.Pool.ClearSessionDead(acct.UID)
+						// 用 CooldownSoftRate 而非固定冷却：60s 起按 softStreak 翻倍，
+						// 任何一次成功即清零。防「chat 恒 401 但 refresh 恒成功」的降级
+						// token 每 60s 轮换一次 RT。
+						h.cfg.Pool.CooldownSoftRate(acct.UID, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh ok, transient)")
+						log.Printf("INFO: [server] 账号 %s 网关 401 但 refresh 成功 → 瞬时拦截，不计 session dead",
+							logfmt.Label(acct.UID, ""))
+						fail(acct.UID)
+						if !rotateBackoff(i, r.Context()) {
+							break
+						}
+						continue
+					case upstream.VerifyInconclusive:
+						// 既不能判活也不能判死（网络/5xx/429/refresh 端点自身被拦）：
+						// 只短退避。判死会在同一层再误杀一次。
+						h.cfg.Pool.CooldownSoftRate(acct.UID, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (refresh inconclusive)")
+						log.Printf("INFO: [server] 账号 %s 网关 401，refresh 未给出明确判词 → 不计 session dead",
+							logfmt.Label(acct.UID, ""))
+						fail(acct.UID)
+						if !rotateBackoff(i, r.Context()) {
+							break
+						}
+						continue
+					}
+					// VerifyDead：refresh 被应用层明确拒绝 → 落到下方 session dead 处置。
+				}
+			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。

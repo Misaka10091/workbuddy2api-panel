@@ -748,6 +748,12 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
+	// refreshMu/refreshInflight/refreshRenewed 刷新单飞与宽限复用（防并发双花 RT），
+	// 见 refresh_singleflight.go。
+	refreshMu       sync.Mutex
+	refreshInflight map[string]*refreshCall
+	refreshRenewed  map[string]refreshResult
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -1038,14 +1044,37 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
 //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// RefreshToken 刷新账号 token（对调用方透明地做单飞 + 宽限复用）。
+//
+// 为什么要单飞：同一账号的 keepalive、请求前预刷新、面板探活会几乎同时发现 token
+// 将过期，各自打一次 refresh 就是拿**同一个 RT 花多次**——上游对 RT 有轮换，并发
+// 双花会让先写回的结果被后写覆盖（本函数的下方写回守卫只能防覆盖，防不住双花）。
+// 单飞保证同 (账号, RT) 同时只有一个网络请求，其余等待者复用结果。
+//
+// 宽限复用：刷新成功后 60s 内，仍持有**旧** RT 快照的调用方直接复用结果，不再花
+// 第二次 RT（与官方 WorkBuddy 认证插件口径一致）。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	if a == nil {
+		return fmt.Errorf("nil auth")
+	}
+	a.Lock()
+	rt := a.RefreshToken
+	a.Unlock()
+	if strings.TrimSpace(rt) == "" {
+		return fmt.Errorf("no refreshToken")
+	}
+	return c.refreshCoalesced(a, rt)
+}
+
+// refreshOnce 真正执行一次刷新（网络往返 + 写回），单飞由 refreshCoalesced 负责。
+func (c *Client) refreshOnce(a *auth.Auth) refreshResult {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
 	atBefore := a.AccessToken
 	a.Unlock()
 	if strings.TrimSpace(rtSnapshot) == "" {
-		return fmt.Errorf("no refreshToken")
+		return refreshResult{err: fmt.Errorf("no refreshToken")}
 	}
 
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
@@ -1053,7 +1082,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
-		return err
+		return refreshResult{err: err}
 	}
 	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
 	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
@@ -1074,7 +1103,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 网络 I/O（锁外，30s 上限）。
 	data, err := c.doJSON(req)
 	if err != nil {
-		return err
+		return refreshResult{err: err}
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -1083,7 +1112,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
+		return refreshResult{err: fmt.Errorf("refresh_failed: no accessToken in response — re-login required")}
 	}
 
 	// 第 2 段（锁内）：校验快照一致后写回。
@@ -1098,7 +1127,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
 		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
 		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
-		return nil
+		return refreshResult{accessToken: a.AccessToken, refreshToken: a.RefreshToken, domain: a.Domain, expiresAt: a.ExpiresAt, at: time.Now()}
 	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -1116,7 +1145,13 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
-	return nil
+	return refreshResult{
+		accessToken:  a.AccessToken,
+		refreshToken: a.RefreshToken,
+		domain:       a.Domain,
+		expiresAt:    a.ExpiresAt,
+		at:           time.Now(),
+	}
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
