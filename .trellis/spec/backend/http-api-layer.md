@@ -90,6 +90,23 @@ writeModelQuotaError(w, quotaCode, ...)                  // {"code":6004,"msg":�
 - `/v1/models` 空列表也要 200，不允许编造模型目录。
 - 面板 JSON 字段同理；空结果必须是 `[]` 而不是 `null`（前端把 `null` 当"功能未启用"）。
 
+## 网关级闸门（2026-10 新增）
+
+除密钥级白/黑名单外，`internal/server` 还有两道**网关级**闸门，二者都是"配置空/0 = 关闭"：
+
+- **模型白名单**（`models.allowed`）：`/v1/models` 与 chat 入口取交集。条目语法 `裸名`（两域）
+  或 `cn:xxx` / `global:xxx`（单域），大小写敏感。列表必须先在**带前缀的原始目录**上过滤再
+  拆前缀——反过来单域视图里 id 已无前缀，无法区分 `cn:` 与 `global:`。拒绝复用 403
+  `model_not_allowed`，文案不区分「不存在 / 未在白名单」，避免枚举探测。
+- **积分闸**（`budget.*`，`budget.go`）：当日上限 / 5 分钟突发 / 连续低缓存率三道，在 chat
+  入口 `admit()`，命中回 429 `insufficient_quota`（当日到顶）或带具体原因的快速闸文案。
+  记账只认 `hasCredit=true` 的 `usage.credit`（缺失≠0），按 CST 自然日惰性归零；
+  缓存率只在 `hasCache=true` 时判定。它是"止血"不是账本，进程内不落盘。
+
+工具调用观测在 `chatStat` 与 `reqlog.Event`：`toolsDeclared` 取请求声明数，`toolCalls`
+流式按 `delta.tool_calls[].index` 去重 + 标记还原数，非流式按 `message.tool_calls` +
+还原数（**两种组包形态都要认**，否则非流式恒 0）。
+
 ## 反模式
 
 - 在 handler 里 `Classify` 第二次：`ChatStreamContext` 已经分类过一次并带回 `Retry-After`。

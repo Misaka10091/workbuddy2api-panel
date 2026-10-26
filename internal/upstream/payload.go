@@ -129,7 +129,17 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 // PrepareBodyOptWithEffortsDefaultAndCaps 在 …AndDefault 之上接入模型输出上限快照：
 // 无显式限额的请求按目录动态值补 max_tokens（见 injectCatalogMaxTokens）。
 // maxOut 为 nil 时行为与 …AndDefault 完全一致。
+//
+// 身份类脱敏作用域固定为 all（既有行为）；需要按 features.sanitize_brand_scope
+// 收窄时用 PrepareBodyOptWithEffortsDefaultAndCapsScope。
 func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) []byte {
+	return PrepareBodyOptWithEffortsDefaultAndCapsScope(src, sanitize, true, efforts, defaultEfforts, maxOut)
+}
+
+// PrepareBodyOptWithEffortsDefaultAndCapsScope 同 …AndCaps，另接身份类脱敏作用域：
+// brandAll=true（scope=all，默认）品牌词规则对所有消息角色生效；false（scope=identity）
+// 只对 system/developer 生效，其余角色按用户数据原样透传。
+func PrepareBodyOptWithEffortsDefaultAndCapsScope(src []byte, sanitize, brandAll bool, efforts map[string][]string, defaultEfforts map[string]string, maxOut map[string]int64) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -193,7 +203,7 @@ func PrepareBodyOptWithEffortsDefaultAndCaps(src []byte, sanitize bool, efforts 
 	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
-			sanitizeMessages(msgs)
+			sanitizeMessages(msgs, brandAll)
 		}
 	}
 	out, err := json.Marshal(obj)

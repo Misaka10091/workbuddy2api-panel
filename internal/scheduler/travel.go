@@ -3,12 +3,13 @@
 package scheduler
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -55,9 +56,18 @@ func (s *Scheduler) RunTravelNow() { s.RunTravelRealm("") }
 // 注意域作用域**不解除** D4 门控：global 账号本就没有 CN 旅行体系，
 // 显式指定 realm="global" 也照样跳过（不发起任何上游调用）。
 func (s *Scheduler) RunTravelRealm(realm string) {
-	realm = normalizeRealm(realm)
+	s.runTravel(context.Background(), normalizeRealm(realm), false)
+}
+
+// runTravel 旅行巡检遍历。spreadOn=true（排程触发）时按账号摊开计划错峰；手动入口
+// 不摊开（面板按钮要的是立刻跑完）。
+func (s *Scheduler) runTravel(ctx context.Context, realm string, spreadOn bool) {
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	plan := s.spreadPlan(taskTravel, spreadOn, time.Now())
+	for _, st := range plan.order(s.cfg.Pool.List()) {
+		if !plan.wait(ctx, st.UID) {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -75,7 +85,9 @@ func (s *Scheduler) RunTravelRealm(realm string) {
 			continue // 企业版门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再跑
+			}
 		}
 		first = false
 		s.travelOne(a)
@@ -149,7 +161,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 		return
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := s.cfg.Upstream.ReportChatActivity(a, session.NewMessageID(), ""); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
 	} else {
 		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）

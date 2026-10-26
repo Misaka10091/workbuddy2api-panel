@@ -34,6 +34,9 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "account_spread_minutes": 20,
+    "account_spread_min_gap_seconds": 30,
+    "night_chat_cap": 3,
     "include_disabled_in_tasks": false
   },
   "cn": {
@@ -57,7 +60,16 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "sanitize_brand_scope": "all"
+  },
+  "models": {
+    "allowed": []
+  },
+  "budget": {
+    "daily_limit": 0,
+    "burst_limit": 0,
+    "cache_low_rate": 0
   },
   "prompt": {
     "mode": "passthrough",

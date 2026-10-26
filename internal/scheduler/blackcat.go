@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -26,12 +27,26 @@ func (s *Scheduler) RunBlackcatNow() { s.RunBlackcatRealm("") }
 // realm=="" 等价于全池（RunBlackcatNow 的现状语义）。
 // 域作用域不解除 D4 门控：global 账号本就没有 CN 夜猫子活动，照样跳过。
 func (s *Scheduler) RunBlackcatRealm(realm string) {
-	realm = normalizeRealm(realm)
+	s.runBlackcat(context.Background(), normalizeRealm(realm), false)
+}
+
+// runBlackcat 夜猫子实现。spreadOn=true（排程触发）时：单轮参与账号数不超过
+// NightChatCap（按日轮换参与，避免同一批账号每天熬夜），且账号之间按摊开计划错峰。
+func (s *Scheduler) runBlackcat(ctx context.Context, realm string, spreadOn bool) {
 	if !upstream.InNightWindow(nowForNightWindow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
-	for _, st := range s.cfg.Pool.List() {
+	list := s.cfg.Pool.List()
+	_, _, capN := s.spreadParams()
+	if spreadOn && capN > 0 {
+		list = nightCapList(list, capN, nowForNightWindow())
+	}
+	plan := s.spreadPlan(taskBlackcat, spreadOn, time.Now())
+	for _, st := range plan.order(list) {
+		if !plan.wait(ctx, st.UID) {
+			return
+		}
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
 		// 与「让位防风控」正面冲突。旅行/成长任务都是纯上报或领奖 RPC，照常跑。
@@ -65,6 +80,8 @@ func (s *Scheduler) RunBlackcatRealm(realm string) {
 			continue
 		}
 		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
-		time.Sleep(activityAccountDelay)
+		if !sleepCtx(ctx, activityAccountDelay) {
+			return
+		}
 	}
 }

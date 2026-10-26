@@ -131,6 +131,9 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 // TestFetchModelsUsesConfiguredUA FetchModels 手工 Set UA 也走覆盖。
 func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	// /v3/config 的探测 UA 恒取自官方 WorkBuddy 家族，不受 upstream.user_agent 覆盖
+	// （issue #51：旧串 `CodeBuddyIDE/...` 在 WorkBuddy 分发包里不存在）。
+	wantV3UA := "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
@@ -139,8 +142,8 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				if got := r.Header.Get("User-Agent"); got != wantV3UA {
+					t.Errorf("v3/config UA = %q want %s", got, wantV3UA)
 				}
 				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			default:

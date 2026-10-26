@@ -205,9 +205,21 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+//
+// CAS 语义（2026-10 竞态修复）：快路径 RUnlock 到加写锁的窗口里，同一会话的失败
+// 路径 Unbind / 成功路径 Bind / 慢路径重分配都可能已改写绑定。无条件回写会把刚
+// 解绑的失败号复活、把粘性跟随的成功号冲回旧号，镜像进 Redis 后连重启都恢复成
+// 错误绑定。故写锁内先核对绑定仍是入参 uid 才滚动；不匹配即放弃本次 touch（以
+// 先落地的显式操作为准）。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	e, ok := r.entries[key]
+	if !ok || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	e.lastActive = now
+	r.entries[key] = e
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }

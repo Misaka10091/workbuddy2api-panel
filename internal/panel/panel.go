@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/apikeys"
@@ -103,7 +104,46 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// batchRunning 五个手动全量接口（签到/旅行/活跃/保活/余额）共用的防重入闸门。
+	// 双击 = 两轮全量并发逐号打上游，每号至少翻倍请求，正是批间节流要规避的场景。
+	batchRunning atomic.Bool
+
+	// modelsMu / modelsCache / modelsCachedAt：/panel/api/models 的短缓存。
+	// 该端点是「CN 目录直连 + global 目录 + 繁忙度」的实时聚合，服务端无缓存时
+	// 异常前端循环或外部脚本可绕过前端的自愿节流。只缓存零错误的完整成功响应。
+	modelsMu       sync.Mutex
+	modelsCache    []map[string]any
+	modelsCachedAt time.Time
 }
+
+// modelsCacheTTL /panel/api/models 的成功结果缓存时长（变量便于测试注入短值）。
+// refresh=1 仍强制重探并刷新缓存。
+var modelsCacheTTL = 60 * time.Second
+
+// cachedModels 返回仍在有效期内的完整成功目录；无缓存/已过期返回 ok=false。
+func (p *Panel) cachedModels() ([]map[string]any, bool) {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+	if p.modelsCache == nil || time.Since(p.modelsCachedAt) > modelsCacheTTL {
+		return nil, false
+	}
+	return p.modelsCache, true
+}
+
+// storeModels 缓存一次零错误的完整成功响应（部分失败不缓存，下次照常重探）。
+func (p *Panel) storeModels(models []map[string]any) {
+	p.modelsMu.Lock()
+	p.modelsCache = models
+	p.modelsCachedAt = time.Now()
+	p.modelsMu.Unlock()
+}
+
+// beginBatch 尝试占用全量任务闸门；已在执行返回 false（调用方回 409）。
+func (p *Panel) beginBatch() bool { return p.batchRunning.CompareAndSwap(false, true) }
+
+// endBatch 释放全量任务闸门（异步动作在 goroutine 内 defer 归还）。
+func (p *Panel) endBatch() { p.batchRunning.Store(false) }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
 func (p *Panel) tryLockAccount(uid string) bool {
@@ -342,6 +382,14 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
+	// 服务端短缓存（60s）：前端自己按「很贵」在节流，但无服务端缓存时异常前端循环
+	// 或外部脚本可以无限重探上游。refresh=1 强制重探并刷新缓存。
+	if r.URL.Query().Get("refresh") != "1" {
+		if cached, ok := p.cachedModels(); ok {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": cached, "cached": true})
+			return
+		}
+	}
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
 
@@ -385,6 +433,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
+	}
+	// 只缓存零错误的完整成功响应：部分失败下次照常重探（否则一次单域抖动会被
+	// 缓存 60s，前端的「刷新」按钮形同虚设）。
+	if len(fetchErrs) == 0 {
+		p.storeModels(out)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
@@ -772,7 +825,14 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := batchRealm(r)
-	go p.cfg.Scheduler.RunCheckinRealm(realm)
+	if !p.beginBatch() {
+		writeErr(w, http.StatusConflict, "全量任务仍在执行中，请等待当前一轮结束")
+		return
+	}
+	go func() {
+		defer p.endBatch()
+		p.cfg.Scheduler.RunCheckinRealm(realm)
+	}()
 	log.Printf("panel: 手动签到已触发（%s，含猫猫旅行）", batchRealmLabel(realm))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
@@ -784,7 +844,14 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := batchRealm(r)
-	go p.cfg.Scheduler.RunTravelRealm(realm)
+	if !p.beginBatch() {
+		writeErr(w, http.StatusConflict, "全量任务仍在执行中，请等待当前一轮结束")
+		return
+	}
+	go func() {
+		defer p.endBatch()
+		p.cfg.Scheduler.RunTravelRealm(realm)
+	}()
 	log.Printf("panel: 手动旅行巡检已触发（%s）", batchRealmLabel(realm))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
@@ -796,7 +863,14 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := batchRealm(r)
-	go p.cfg.Scheduler.RunActivityRealm(realm)
+	if !p.beginBatch() {
+		writeErr(w, http.StatusConflict, "全量任务仍在执行中，请等待当前一轮结束")
+		return
+	}
+	go func() {
+		defer p.endBatch()
+		p.cfg.Scheduler.RunActivityRealm(realm)
+	}()
 	log.Printf("panel: 手动活跃上报已触发（%s）", batchRealmLabel(realm))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
@@ -808,7 +882,14 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := batchRealm(r)
-	go p.cfg.Scheduler.RunKeepaliveRealm(realm)
+	if !p.beginBatch() {
+		writeErr(w, http.StatusConflict, "全量任务仍在执行中，请等待当前一轮结束")
+		return
+	}
+	go func() {
+		defer p.endBatch()
+		p.cfg.Scheduler.RunKeepaliveRealm(realm)
+	}()
 	log.Printf("panel: 手动保活已触发（%s）", batchRealmLabel(realm))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "realm": realm})
 }
@@ -823,6 +904,11 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := batchRealm(r)
+	if !p.beginBatch() {
+		writeErr(w, http.StatusConflict, "全量任务仍在执行中，请等待当前一轮结束")
+		return
+	}
+	defer p.endBatch()
 	p.cfg.Scheduler.RunBalanceRefreshRealm(realm)
 	p.syncNicknames()
 	log.Printf("panel: 手动余额刷新完成（%s）", batchRealmLabel(realm))

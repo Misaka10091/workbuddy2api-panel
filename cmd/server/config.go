@@ -107,6 +107,16 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// AccountSpreadMinutes 账号遍历型任务（签到 / 旅行 / 活跃 / 保活 / 夜猫子）的
+		// 摊开窗口（分钟）：每个账号在窗口内按 hash(任务|uid|日) 的偏移执行，避免同一秒
+		// 打全池。0 = 关闭（旧行为），缺省 20。
+		AccountSpreadMinutes int `json:"account_spread_minutes"`
+		// AccountSpreadMinGapSeconds 摊开窗口内相邻账号的最小间隔（秒），冲突时把靠后
+		// 的账号推开；缺省 30，0 = 不推开。
+		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
+		// NightChatCap 夜猫子单轮参与账号数上限（按日轮换参与）；缺省 3，0 = 不限。
+		NightChatCap int `json:"night_chat_cap"`
 	} `json:"schedule"`
 
 	CN struct {
@@ -162,7 +172,30 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，
+		// 与上游既有行为一致）；"identity" = 仅 system/developer，其余角色按用户数据原样透传。
+		SanitizeBrandScope string `json:"sanitize_brand_scope"`
 	} `json:"features"`
+
+	// Models 模型对外暴露控制（与密钥级白/黑名单正交，取交集）。
+	Models struct {
+		// Allowed 网关级模型白名单：空 = 不启用（现状）；配了就是「只放这些」。
+		// 条目语法与密钥过滤一致：裸名 = 两域可见；"cn:xxx"/"global:xxx" = 只该域。
+		// 白名单在别名/前缀解析之后判定，写前缀写法无法绕过；与黑名单交集。
+		Allowed []string `json:"allowed"`
+	} `json:"models"`
+
+	// Budget 积分闸（0 = 关闭）。三项独立启用：当日累计上限 / 5 分钟突发窗口 /
+	// 连续低缓存率。只按上游回传的 usage.credit 记账（缺失不记 0），CST 自然日归零，
+	// 进程内累计不落盘——它是「止血」而不是账本，账本在 usage.json。
+	Budget struct {
+		// DailyLimit 当日累计积分上限；used >= limit 即 429 insufficient_quota。
+		DailyLimit float64 `json:"daily_limit"`
+		// BurstLimit 5 分钟窗口内的积分上限（拦「一次上下文 20+ 积分」的突发烧分）。
+		BurstLimit float64 `json:"burst_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于该百分比即冷却 60s 再放行（0 = 关）。
+		CacheLowRate float64 `json:"cache_low_rate"`
+	} `json:"budget"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -285,6 +318,11 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	// 账号摊开：生产默认开启（20 分钟窗口 / 相邻 30 秒 / 夜猫子最多 3 个）。只错开时刻，
+	// 不改业务判据；显式配 0 即恢复「同一秒打全池」的旧行为。
+	c.Schedule.AccountSpreadMinutes = 20
+	c.Schedule.AccountSpreadMinGapSeconds = 30
+	c.Schedule.NightChatCap = 3
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -293,6 +331,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBrandScope = "all"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -456,6 +495,9 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_SANITIZE_BRAND_SCOPE"); v != "" {
+		c.Features.SanitizeBrandScope = v
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -482,6 +524,26 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+	// 身份类脱敏作用域：只认 all / identity，其余（含空）回落 all——未知值不该让
+	// 脱敏静默收窄，也不该阻断启动。
+	switch strings.ToLower(strings.TrimSpace(c.Features.SanitizeBrandScope)) {
+	case "identity":
+		c.Features.SanitizeBrandScope = "identity"
+	default:
+		c.Features.SanitizeBrandScope = "all"
+	}
+	// 网关级模型白名单：去空白、丢空条目、保序去重（重复条目没有额外语义）。
+	c.Models.Allowed = normalizeModelList(c.Models.Allowed)
+	// 积分闸：负值无语义，归零（0 = 关闭该道闸）。
+	if c.Budget.DailyLimit < 0 {
+		c.Budget.DailyLimit = 0
+	}
+	if c.Budget.BurstLimit < 0 {
+		c.Budget.BurstLimit = 0
+	}
+	if c.Budget.CacheLowRate < 0 {
+		c.Budget.CacheLowRate = 0
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
 	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
@@ -612,10 +674,41 @@ func (c *Config) normalize() error {
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
+	// 账号摊开参数：负值无语义，归零（0 = 关闭该项，保留旧行为）；正数原样透传。
+	if c.Schedule.AccountSpreadMinutes < 0 {
+		c.Schedule.AccountSpreadMinutes = 0
+	}
+	if c.Schedule.AccountSpreadMinGapSeconds < 0 {
+		c.Schedule.AccountSpreadMinGapSeconds = 0
+	}
+	if c.Schedule.NightChatCap < 0 {
+		c.Schedule.NightChatCap = 0
+	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// normalizeModelList 去空白、丢空条目、保序去重。模型名大小写敏感（上游 id 即大小写敏感）。
+func normalizeModelList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		v := strings.TrimSpace(raw)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

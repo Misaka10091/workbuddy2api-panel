@@ -129,6 +129,28 @@ block := "<" + p + "DSML" + p + " calls>" +
 
 覆盖范围：`content`（字符串或 text 分块）、**`tool_calls[].function.arguments`**、`reasoning_content` 与 `reasoning`。漏掉 arguments 曾是真实盲区。开关是 `Client.SanitizeFingerprints`（atomic，默认 true），既可由配置也可由面板热改。
 
+身份类规则（品牌词 `DeepSeek Harness` → `DeepSeekRuntime`）单独成组，作用域由 `features.sanitize_brand_scope` 控制：`all`（默认）= 所有消息角色；`identity` = 仅 `system`/`developer`，其余角色原样透传。实现上 `sanitizeTextWith(text, brand)` 区分两类规则，`sanitizeMessages(msgs, brandGlobal)` 逐条按 role 决定是否应用；`PrepareBodyOptWithEffortsDefaultAndCapsScope` 透传作用域，旧函数保持 `all` 语义。
+
+## 出站头族与指纹（2026-10 同步，issue #51）
+
+上游把「客户端形态不一致」当作渠道校验判据，因此头集合必须逐项对齐真机抓包，而不是「多一个头无所谓」。
+
+| 规则 | 实现 | 为什么 |
+|---|---|---|
+| `/v3/config` UA | `v3ProbeUA` / `v3ProbeUALite` | CN 三段 `WorkBuddy/<v> WorkBuddy/<v> CLI/<c>`，global 两段 `WorkBuddy/<v> CLI/<c>`；旧 `CodeBuddyIDE/…` 在 WorkBuddy 分发包里不存在，是最显眼的非官方指纹 |
+| chat 头剥离 | `ChatHeaders` | 不发 `Origin`/`Referer`/`Accept-Language`/`X-Machine-ID`/`X-Session-ID`；这些是 REST 通用层形态，桌面 chat 从不发 |
+| 不发明哨兵头 | `ChatHeaders` / `injectGlobalChatHeaders` | 个人号两个方向都不发 `X-No-Enterprise-Id`/`X-No-Department-Info` |
+| `Accept` | `ChatHeaders` | 只 `application/json`（官方仍收 SSE 流）；`Accept-Encoding` 刻意不设，否则关闭 net/http 透明解压 |
+| `X-Private-Data` | `ChatHeaders` | 官方 chat 恒发 `true` |
+| `X-Product` | `injectAttribution` | 恒 `SaaS`；产品名由 `X-IDE-Name/Type/Version` 承载（同名不同值比多头更易被规则命中） |
+| 桌面任务链 | `DesktopChatWithExpert` | 一律走 `ChatHeaders`，不再手搓 20 多头（手搓是漂移根因） |
+| 桌面上报指纹 | `desktopFingerprint` | `osVersion=10.0.28000`、`cpuModel`、`cpuCores=8`、`memorySize=16`；`qimei36` **仅 CN**（国际版真机不带） |
+| `X-Domain` | `desktopHost` | 上报头发**裸主机名**，不是带 scheme 的 URL |
+| `X-Request-ID` | `session.NewMessageID` | 32 hex 消息 ID 形态，不是十进制纳秒 |
+| 会话 ID | `session.NewConversationID` | v4 UUID；**禁止** `wb2api-*` 自证前缀进任何出站字段 |
+
+自证前缀曾散落 15 处（面板任务、排程活跃、旅行领养、夜猫子、校园活动、桌面会话）。新增出站 ID 一律用 `internal/session` 的两个生成器，不要再手拼 `fmt.Sprintf("wb2api-…")`。
+
 ## 三个 CN base 的分工（不可互换）
 
 | base | 域名 | 承载 | 指纹/判据 |

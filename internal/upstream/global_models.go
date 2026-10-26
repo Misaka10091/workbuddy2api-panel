@@ -204,8 +204,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
 	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
 	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
-	v3IDECh := probeV3(codeBuddyIDEUA)
-	v3CLICh := probeV3(codeBuddyCLIUA)
+	// 第二、三路：官方 WorkBuddy 家族的两/三段式 UA（见 v3ProbeUA / v3ProbeUALite）。
+	// 旧实现用 `CodeBuddyIDE/...` 与 `CLI/... CodeBuddy/...`，那两串在 WorkBuddy
+	// 分发包里不存在，属于最显眼的非官方指纹（issue #51）。
+	v3IDECh := probeV3(c.v3ProbeUA(a))
+	v3CLICh := probeV3(c.v3ProbeUALite(a))
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。

@@ -780,6 +780,10 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// SanitizeBrandAll 身份类脱敏（品牌词）作用域：true（默认，scope=all）= 所有消息角色，
+	// false（scope=identity）= 仅 system/developer。热改走 atomic，与上面同因。
+	SanitizeBrandAll atomic.Bool
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -852,6 +856,7 @@ func New() *Client {
 		GlobalEnabled: true,
 	}
 	c.SanitizeFingerprints.Store(true)
+	c.SanitizeBrandAll.Store(true)
 	return c
 }
 
@@ -946,7 +951,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID, convReqID 
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsDefaultAndCaps(body, c.SanitizeFingerprints.Load(), efforts, defs, maxOut)
+	body = PrepareBodyOptWithEffortsDefaultAndCapsScope(body, c.SanitizeFingerprints.Load(), c.SanitizeBrandAll.Load(), efforts, defs, maxOut)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1429,25 +1434,6 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	return false
 }
 
-// codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
-// CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
-// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
-// （flash：393216 + low/high/max）。
-// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
-const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
-
-// codeBuddyCLIUA CLI 三段式 UA。**实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**：
-//   - IDE UA  → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
-//   - CLI UA  → 22 条（22 个 chat：**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
-//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
-//
-// 注意两点，都与旧注释相反，勿再按旧注释推断：
-//  1. 旧注释称「CLI UA 拿到精简目录、IDE UA 才返回完整能力」——实测模型数量恰好相反，
-//     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
-//     而非模型更多。两路各有独有模型，缺一不可。
-//  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
-
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
 // v3-config-merge：动态目录 = /v3/config（主，IDE UA 完整能力版）+ 企业端点
@@ -1616,12 +1602,12 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
+// fetchV3Models 单路探测 /v3/config（官方桌面端 UA，见 v3ProbeUA）。
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	byID, err := c.fetchV3ConfigModelMap(a, c.v3ProbeUA(a))
 	if err != nil {
 		return nil, err
 	}
@@ -1905,7 +1891,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
 	if ua == "" {
-		ua = codeBuddyIDEUA
+		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)

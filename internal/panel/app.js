@@ -1418,12 +1418,14 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
-async function loadModels() {
+// force=true（点「重新获取」按钮）时带 refresh=1 绕过服务端 60s 短缓存；
+// 切视图/首次加载走缓存，避免每进一次页面就打一轮上游。
+async function loadModels(force) {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = await Promise.all([api('models' + (force ? '?refresh=1' : '')), api('model_probes').catch(() => ({}))]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
     if (!mdAll.length) {
@@ -1564,7 +1566,7 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
 }
 $('mdReset').onclick = resetModelFilter;
-$('btnModels').onclick = loadModels;
+$('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
