@@ -35,6 +35,15 @@ docs/
 *.md
 !README.md
 
+# Trellis 知识库（spec / tasks / workflow）必须进版本库：
+# 上面的 *.md 全局忽略会把它们一并挡掉，导致规范只存在于本机。
+!.trellis/**/*.md
+
+# 编辑器备份与本地临时目录（不属于源码，也不要进库）
+*~
+/.diffdump/
+/.diffscratch/
+
 # Windows binaries
 /wb2api.exe
 /login.exe
