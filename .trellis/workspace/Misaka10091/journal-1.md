@@ -26,3 +26,27 @@
 **备注**：本地原本没有 `cn` 配置节，本次按上游语义补齐；属装配期字段，
 **无条件**列入 `restartRequiredFields`（返回整类清单而非 diff，否则「覆盖值 → 清空」
 不会提示）。token 刷新与 chat 共用 `chatBase`，OAuth 设备授权才走 `copilot.tencent.com`。
+## 2026-10-27 同步上游风控（branch `sync/upstream-risk-control`，commit `7e18624`）
+
+**做了什么**：逐文件核对上游 `misakano7545/workbuddy2api-panel` HEAD `37b3f4c`，按 P0 出站指纹 /
+P1 频控 / P2 状态落盘 / P3 观测与暴露面四组移植，48 文件、+2087/-191。
+
+**关键判断**
+- 本地是手工挑选同步分支（分叉点 `dbd7c68`），不能 merge；错误码分类、6004 冷却、401 求证、
+  首帧否决此前已同步，本次不重复。
+- `/v3/config` 的 `CodeBuddyIDE/…` UA 已从分发包消失，是最显眼的非官方指纹；换成 WorkBuddy
+  两/三段式后目录覆盖面略降，接受。
+- 头族剥离只做 chat 域（billing/checkin 无真机证据）；`X-Product` 恒 `SaaS`、产品名走 `X-IDE-*`。
+- 白名单执法点按本地路由收敛为 `/v1/models` + chat（无 images/search）。
+- 摊开/抖动/夜猫子上限全部「配置 0 = 旧行为」，可热关，不需要回滚代码。
+
+**踩坑**
+- 用 PowerShell 批量正则替换 `sanitize_test.go` 把 UTF-8 中文写坏（Set-Content 默认 ANSI），
+  已 `git checkout` 回滚改用 edit 工具。教训：中文文件禁止用 shell 字符串批量改写。
+- `newAccountSpread` 的最小间隔只对「按计划排序后」的相邻账号成立，测试需用 `plan.order()`，
+  不能用 uid 顺序断言。
+
+**验证**：`go build ./...`、`go vet ./...` 通过；`go test ./...` 16 包全绿；新增 8 组回归测试。
+
+**遗留**：`X-API-Key` 双头与 images/search 白名单在本地不适用；CN 对话主域改
+`www.workbuddy.cn`（上游 `741cf59`）涉及路由变更，待单独决策。
