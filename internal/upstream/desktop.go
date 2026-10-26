@@ -5,7 +5,7 @@
 // **不同的客户端指纹**：
 //
 //	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1
+//	User-Agent: WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0（CN；global 走 workbuddy-ai）
 //	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
@@ -39,12 +39,41 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	// desktopVersion* / desktopCommit* / desktopReleaseDate* 官方分发包实测三元组。
+	// 两版分发包不同 → 三元组不同，故**按 realm 分开**：
+	//   CN 5.8.3（www.workbuddy.cn） / global 5.8.4（www.workbuddy.ai）。
+	// 上报体里的 ideVersion/extVersion/commit/releaseDate 与 UA 必须同源同版本：
+	// 版本段彼此不一致本身就是可判别的指纹。
+	desktopVersionCN         = "5.8.3"
+	desktopCommitCN          = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
+	desktopReleaseDateCN     = int64(1792029498676)
+	desktopVersionGlobal     = "5.8.4"
+	desktopCommitGlobal      = "73952edb48da46bd0b244661efe22f4f247c4977"
+	desktopReleaseDateGlobal = int64(1792063084107)
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
+
+// desktopTriple 返回该账号域的桌面端 (ideVersion, commit, releaseDate) 三元组。
+// nil（默认 CN 形态）走 CN 值。
+func desktopTriple(a *auth.Auth) (ver, commit string, release int64) {
+	if a != nil && a.IsGlobal() {
+		return desktopVersionGlobal, desktopCommitGlobal, desktopReleaseDateGlobal
+	}
+	return desktopVersionCN, desktopCommitCN, desktopReleaseDateCN
+}
+
+// desktopUAFor 桌面端 UA：两段品牌一致（与业务链路同源，都是 SDK 的 buildUserAgent），
+// 与 chat UA（首段恒驼峰 `WorkBuddy`）刻意不同：
+//
+//	CN     → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0
+//	global → workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0
+func desktopUAFor(a *auth.Auth) string {
+	ver, _, _ := desktopTriple(a)
+	brand := uaBrandFor(a)
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + defaultCliVersion
+}
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
@@ -59,6 +88,7 @@ type DesktopEvent map[string]any
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
+	ver, commit, release := desktopTriple(a)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
@@ -66,15 +96,15 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"releaseDate":  release,
+		"commit":       commit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   ver,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -115,7 +145,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Domain", c.desktopBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
@@ -216,7 +246,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -393,7 +423,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
@@ -438,10 +468,12 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 		return "", "", err
 	}
 	h := req.Header
+	// 桌面端版本段按 realm 取（与上报体/UA 同源，避免版本段彼此不一致）。
+	ideVer, _, _ := desktopTriple(a)
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
+	h.Set("User-Agent", desktopUAFor(a))
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
@@ -451,7 +483,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", ideVer)
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)

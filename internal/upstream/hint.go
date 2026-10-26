@@ -61,6 +61,17 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
+	case ErrUpstreamBusy:
+		// 渠道级容量信号（6020 queue.waiting / 6021 queue.full）：换号打的是同一堵墙，
+		// 客户端唯一有效的动作是等一小会儿再重试（网关已带 Retry-After）。
+		return "upstream channel is at capacity (queue waiting/full); retry after a short wait — switching accounts will not help"
+	case ErrToolMismatch:
+		// 11148：请求内容级配对断裂，上游明示「直接重试无效，请新建任务」。
+		return "tool calls and tool results do not match in this request; start a new conversation (retrying the same body fails identically)"
+	case ErrModelParamInvalid:
+		// 11133 家族通常已被上方 isModelParamInvalid 分支接走；这里是兜底
+		// （msg 形态未命中词表但分类已是 ErrModelParamInvalid 的情形）。
+		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	case ErrContentBlocked:
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
@@ -139,6 +150,11 @@ func isInvalidImageData(body string) bool {
 
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
+// HasCodeMarker 包外判据入口（server 侧 applyErrorPolicy 分野用）：按 codeMarker 的
+// 空白容差在原文里找业务码。同一条 msg 骑不同 code 的故障要靠它区分——例如
+// "request illegal" 既是 11140 授权风控，也是 "11-128" 渠道校验拦截。
+func HasCodeMarker(body, code string) bool { return codeMarker(strings.ToLower(body), code) }
+
 func codeMarker(lower, code string) bool {
 	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
 		if strings.Contains(lower, v) {
