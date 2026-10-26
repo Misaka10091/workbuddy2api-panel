@@ -50,18 +50,37 @@ func TestCooldownModelBusyShortWindow(t *testing.T) {
 	}
 }
 
-// TestCooldownModelBusyDoublesAndCaps 反复命中按 2 倍升级，封顶 1 分钟。
+// TestCooldownModelBusyDoublesAndCaps 窗口过期后再次命中按 2 倍升级，封顶 1 分钟。
+//
+// 断言方式说明（此前这里是 flaky 的根因）：
+//   - 模拟「窗口过期」必须把 Until 拨到过去、**保留 Hits**——直接删表项会把 Hits 清零，
+//     阶梯永远停在首档，测不到翻倍；
+//   - 期望值用固定序列 + 容差比较，不能用「本次时长 ≥ 上次时长」：Until 由调用内的
+//     time.Now() 加出来、before 是调用外的采样，两者相差几十纳秒，抖动方向随机，
+//     相邻档位一旦同值（封顶后必然同值）就会假失败。
 func TestCooldownModelBusyDoublesAndCaps(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	const model = "glm-5.3"
 
-	// 每次命中前把已存窗口清空，模拟「窗口过期后再次命中」的阶梯升级。
-	var last time.Duration
-	for i := 0; i < 8; i++ {
+	// 10s 起，逐次翻倍：10s → 20s → 40s → 封顶 60s，之后一直 60s。
+	want := []time.Duration{
+		10 * time.Second,
+		20 * time.Second,
+		40 * time.Second,
+		modelBusyMax,
+		modelBusyMax,
+		modelBusyMax,
+	}
+	for i, wantD := range want {
 		p.mu.Lock()
 		if e := p.byUID["u1"]; e != nil {
-			delete(e.modelCooldowns, model)
+			if e.modelCooldowns == nil {
+				e.modelCooldowns = map[string]modelCooldown{}
+			}
+			mc := e.modelCooldowns[model]
+			mc.Until = time.Now().Add(-time.Second) // 过期但保留 Hits
+			e.modelCooldowns[model] = mc
 		}
 		p.mu.Unlock()
 
@@ -71,14 +90,12 @@ func TestCooldownModelBusyDoublesAndCaps(t *testing.T) {
 		mc := p.byUID["u1"].modelCooldowns[model]
 		p.mu.Unlock()
 
-		d := mc.Until.Sub(before)
-		if d < last {
-			t.Fatalf("第 %d 档不应变短：%v < %v", i+1, d, last)
+		if got := mc.Until.Sub(before); got < wantD-time.Second || got > wantD+time.Second {
+			t.Fatalf("第 %d 次命中窗口≈%v，want≈%v（实际 %v）", i+1, got, wantD, mc.Until.Sub(before))
 		}
-		last = d
-	}
-	if last > modelBusyMax+time.Second {
-		t.Fatalf("封顶应为 %v，得到 %v", modelBusyMax, last)
+		if mc.Hits != i+1 {
+			t.Fatalf("第 %d 次命中 Hits=%d want %d（Hits 必须跨窗口累计才有阶梯）", i+1, mc.Hits, i+1)
+		}
 	}
 }
 
