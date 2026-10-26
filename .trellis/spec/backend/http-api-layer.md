@@ -81,7 +81,8 @@ writeModelQuotaError(w, quotaCode, ...)                  // {"code":6004,"msg":�
 
 - 服务端：`ReadHeaderTimeout` 30s、`ReadTimeout` 来自配置、`IdleTimeout` 120s，**不设全局 `WriteTimeout`**（会误杀在途 SSE）。
 - 上游：首字节由 `Transport.ResponseHeaderTimeout` 管；流中停滞由 `IdleTimeout` + `monitorBody` 管。
-- 超时归类为基础设施故障：**不换号、不罚号**，直接 `break` 返回。
+- **上游超时/停滞**（`net.Error.Timeout()`、显式 deadline、或客户端仍在但 ctx 被空闲看门狗掐掉）视为基础设施故障：**不换号、不罚号**，直接 `break` 返回。换号撞的是同一个慢上游，只会把客户端拖到 `MaxRotate × header_timeout`。
+- **普通传输错误**（连不上、连接被重置）不是同一回事：换号 + `NoteFailures`（连败达 `degrade_threshold` 才降权）。判据在 `isUpstreamTimeout`。
 
 ## 对外契约只增不改
 

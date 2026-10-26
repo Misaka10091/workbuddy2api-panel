@@ -78,8 +78,8 @@ cmd/server → 注入闭包把 upstream 的能力递给 pool（pool 不 import u
 |------|------|------|
 | 限流账号被记成健康 | 上游回 200 但第一帧是 error 帧，成功判定发生在"拿到响应"而不是"这一跳真成功" | `handler.go` 轮换循环的 `recordAttempt` / 粘性绑定位置 |
 | 会话键漂移 | `TurnKey` 在 `prompt.Rewrite` 之后才取，改写动了 messages | `handler.go` 的 `turnKey` 注释 |
-| 面板显示"已保存"但没生效 | `upstream.user_agent` 在装配期被写出站 client 捕获，既不在 livecfg 也不在重启清单 | `cmd/server/main.go` `restartRequiredFields` |
-| 单模型限流升级成整号冷却 | 6004 被写进了账号级 `until` | `internal/pool/cooldown.go` `CooldownSoftForModel` |
+| 面板显示"已保存"但没生效 | `upstream.user_agent` 被出站 client 在装配期捕获，当时既不在 livecfg 也不在重启清单（现已补入；同类缺口仍在，见 config 规范） | `cmd/server/main.go` `restartRequiredFields` |
+| 单模型限流升级成整号冷却 | 带重置时间的 6004 被无条件写成账号级 `until`（现在只有无重置文案时才如此） | `internal/pool/cooldown.go` `CooldownSoftForModel` |
 | 整池被推到 2h 封顶 | 冷却中重复失败还在推进 streak / 延长 `until` | `cooldown.go` / `degrade.go` 的"不叠加"注释 |
 | 客户端拿不到上游错误详情 | error 帧被塞进 SSE 白名单重建，`code/msg/requestId` 被剥掉 | `sse.go` 的 `writeRaw` 分支 |
 | 工具调用完全没净化 | 净化只扫 `content`，漏了 `tool_calls[].function.arguments` | `sanitize.go` |

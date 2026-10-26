@@ -44,7 +44,7 @@ paths:
 | API key | `abcd******wxyz` | `apikeys.Redact` |
 | 客户端 UA | 截断到 200 字节 + 压缩成客户端标签 | `maxUserAgentLen`、`logfmt.ShortUA` |
 | 上游请求体/响应片段 | 截断到 200 字节 | `logfmt.Truncate` |
-| 客户端 IP / UA | **默认不记录**，只有 `livecfg.RecordClientInfo` 为真才采集 | `captureClientInfo` |
+| 客户端 IP / UA | **默认记录**：`Default()` 显式置 `logging.request_client_info = true`（与排程开关同款"缺省 true"写法）；关闭须显式 `logging.request_client_info=false`，关闭后归档里因 `omitempty` 直接**没有** `client_ip` / `user_agent` 键 | `requestTrace.captureClientInfo` + `livecfg.RecordClientInfo` |
 | 提示词 / 响应正文 / Authorization | 永不记录 | — |
 
 `internal/reqlog` 的 `Event` 结构体里**没有** body/message 字段——这是刻意的结构级约束，不要为了"方便排障"加一个 `body` 字段。

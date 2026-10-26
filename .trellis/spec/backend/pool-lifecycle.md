@@ -95,15 +95,17 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 |------|------|------|--------|
 | 429 无重置时间 | `CooldownSoftRate` | `d << (streak-1)`，封顶 `soft_rate_max` | `cooldown.soft_rate` / `cooldown.soft_rate_max` |
 | 429 有重置时间 | 同上 | `min(上游重置时刻, now+soft_rate_max)`，**绝不指数堆加** | 同上（只取上界） |
-| 6004/6000 模型限额 | `CooldownSoftForModel` | 只写 `modelCooldowns[model]`，保留上游墙钟 | `soft_rate_max` 仅作上界 |
+| 6004/6000 **且 body 有**「将在 … 重置」 | `CooldownSoftForModel` | 只写 `modelCooldowns[model]`（保留上游墙钟），**不写账号级 `until`** → 切模型即可用 | `soft_rate_max` 仅作上界 |
+| 6004/6000 **但无重置文案** | `CooldownSoftRate` + `RecordModelRateLimitAudit` | 账号级冷却（有 `Retry-After` 头则到该时刻，否则 `soft_rate` 有界退避）；模型条目只作审计展示，**不产生模型豁免** | `cooldown.soft_rate*` / `soft_rate_max` |
 | 14003 模型忙 | `CooldownModelBusy` | 10s 起 ×2，封顶 1m | 硬编码 |
 | 402 余额耗尽 | `CooldownUntilTomorrow4AM` | 到本地 04:00（04:00 前则今天 04:00） | 硬编码 |
 | 404 | handler 调 `Cooldown(CoolSoft, 60s)` | 固定 60s，不推进 streak | 硬编码（有意不复用 `soft_rate`） |
 | 11102/11158 | `BlockModelBackoff` | 6h 起 ×2，封顶 24h | 硬编码 |
 | 5xx 熔断 | `recordBreakerFailureLocked` | `breaker_cooldown << retryCount`，封顶 `breaker_cooldown_max` | `pool.breaker_threshold` / `breaker_cooldown` / `breaker_cooldown_max` |
 | 未分类失败 | `NoteFailures` | 固定 `degrade_cooldown`，封顶 `degrade_cooldown_max` | `pool.degrade_threshold` / `degrade_cooldown` / `degrade_cooldown_max` |
-| 登录态连续失效 | `NoteSessionDead` | 连续 3 次 → disable | 硬编码阈值 |
-| 在途 | `Acquire`/`Release` | 租约，`0 = 不限` | `pool.max_in_flight` / `pool.max_in_flight_global` |
+| 登录态连续失效（**仅保活任务**） | `NoteSessionDead` | 连续 3 次 → disable；刷新成功清零 | 硬编码阈值（聊天路径不走上限，直接 `Disable`） |
+| 在途租约（普通号） | `Acquire`/`Release` | `pool.max_in_flight`：**`0 = 不限`**，>0 即该值 | `pool.max_in_flight` |
+| 在途租约（global 分档） | `Acquire`/`Release` | `pool.max_in_flight_global`：**`<=0` 在 `normalize()` 里回落为 2**（分档键的 0 没有"不限"语义，见 `config.go` 注释），>0 即该值 | `pool.max_in_flight_global` |
 
 铁律：**已在冷却中的重复失败不推进 streak、不延长到期**（`cooldown.go` / `degrade.go` 注释均钉住）。`softDurationLocked` 用 `softStreakShiftMax=16` 防位移溢出。
 
@@ -153,7 +155,7 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 ## 反模式
 
 - 在 `internal/scheduler` 或 `internal/server` 直接改 `entry` 字段（绕过 `transition.go`）。
-- 给 6004 也写 `until`（会把单模型限流升级成整号冷却）。
+- 把 6004/6000 **无条件**写成账号级冷却：只有 body 无重置文案时才是账号级；带重置文案时写账号级 `until` 会把单模型限流升级成整号冷却。
 - 在 `NoteSuccess` 里顺手清 `modelCooldowns`。
 - 让 `reviveCoolingLocked` 清掉 `softStreak` / breaker。
 - 给状态文件计数器加 `omitempty`，或给截止时间用非指针 `time.Time`。

@@ -13,13 +13,15 @@ paths:
 
 ## 三道闸门
 
-| 闸门 | 测什么 | 位置 |
-|------|--------|------|
-| `node --check app.js` | 语法（对象字面量键没加引号这类会白屏的错误） | `TestAppJSSyntax` |
-| 顶层求值冒烟 | 真实执行 `app.js` 顶层代码，抓 TDZ / `ReferenceError` | `TestAppJSTopLevelSmoke` |
-| Go 侧结构断言 | `index.html` 结构、CSP、缓存头、`CFG_MAP` 一致性 | `security_test.go`、`frontend_test.go` 等 |
+| 闸门 | 测什么 | 需要 node？ | 位置 |
+|------|--------|:---:|------|
+| `node --check app.js` | 语法（对象字面量键没加引号这类会白屏的错误） | 是 | `TestAppJSSyntax` |
+| 顶层求值冒烟 | 真实执行 `app.js` 顶层代码，抓 TDZ / `ReferenceError` | 是 | `TestAppJSTopLevelSmoke` |
+| Go 侧结构断言 | `index.html` 结构、CSP、缓存头、`CFG_MAP` 一致性 | **否** | `security_test.go`、`TestConfigFormMatchesCFGMap` 等 |
 
-**没有 node 时三者都会 `t.Skip`**（`exec.LookPath("node")` 判定）。所以本机"测试通过"可能意味着 JS 一行都没跑。真跑需要本机有 node。
+只有**执行 JS** 的测试用 `exec.LookPath("node")` 做前置并在缺失时 `t.Skip`。**Go 侧结构断言不需要 node**：它们只是读 `index.html` / `app.js` 的字节做 `strings.Contains` 与正则匹配（`security_test.go` 全篇、`TestConfigFormMatchesCFGMap`、`TestAppJSSyntax` 以外的 index 断言都是这一类），所以在无 node 的机器上依然会真跑、真失败。
+
+推论：无 node 时"全绿"只代表结构契约没破、**JS 一行没执行**；判断改动的 UI 行为是否可用，必须在有 node 的环境再跑一次。
 
 ## 模式一：标记切片 + `vm` 单测
 

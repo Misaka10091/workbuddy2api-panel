@@ -93,7 +93,22 @@ server.read_timeout
 
 这些值在装配期被监听地址 / 出站 `http.Client` / 目录句柄 / 归档 writer 捕获。**新增一个装配期字段时，必须同时把它加进这个清单**——`upstream.user_agent` 曾因漏列导致"面板显示已保存但毫无效果"（issue #102）。
 
-不属于上述清单的字段，保存后必须真的立刻生效：在 `saveConfig` 里补 `live.Store(...)` 或对应 setter，否则就是同一类 bug。
+### 清单目前并不完整（现状缺口，别当成已实现边界）
+
+`restartRequiredFields` 只覆盖了**已知会被装配期捕获**的一部分字段。下列字段同样是在启动时装配、之后不再读取，但**不在**清单里，因此面板保存后会显示"已保存并立即生效"而实际不生效：
+
+| 字段 | 装配位置 | 捕获方式 |
+|------|----------|----------|
+| `prompt.mode`、`prompt.file`（→ `PromptText`） | `cmd/server/main.go` → `server.Config{PromptMode, PromptText}` | 进 handler 结构体，请求期不重读 |
+| `global.enabled` | `up.GlobalEnabled`、`auth.SetGlobalEnabled`、`server.Config.GlobalEnabled` | 三处一次性写入（上游闸 / auth 闸 / handler 闸） |
+| `global.chat_base`、`global.billing_base` | `up.ChatBaseGlobal`、`up.BillingBaseGlobal` | 出站 base 装配后固定 |
+| `upstream.client_version`、`cli_version`、`client_name` | `up.ClientVersion` / `up.CliVersion` / `up.ClientName` | 出站 UA 与归属头在装配期定型 |
+| `upstream.device_token`、`device_token_file`、`passthrough_ip` | `up.DeviceToken` / `up.DeviceTokenFile` / `up.PassthroughIP` | 同上 |
+
+写新代码时的正确规则是两条：
+
+1. **不要**把这份清单当作"其余字段必然热生效"的证明——要判断某个字段是否真的热生效，去 `saveConfig` 里看它有没有 `live.Store(...)` 或对应 setter。
+2. 新增任何"装配期捕获"的字段，**必须**同时加进 `restartRequiredFields`；顺手把上面缺口表里的项补进去更好（属于已知技术债，改它要单独一次提交并配测试）。
 
 ## 改配置字段的最小动作集
 

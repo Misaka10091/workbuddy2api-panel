@@ -66,11 +66,36 @@ paths:
 
 上游只在请求**声明了 `tools`** 时才会把标记解析成结构化 `tool_calls`。中转环节丢 `tools` 是常态，于是标记以纯文本落进 `content`，只认结构化调用的客户端（Codex 等）就当正文写进历史、回合直接结束。网关是最后一道防线。
 
-标记形态（`dsml.go`）：全角竖线 `U+FF5C` 包裹的标签
+标记形态（`dsml.go`）：分隔符 `markupPipe = "\uFF5C\uFF5C"` 是**两个**全角竖线 U+FF5C —— **不是**一个 `‖`（U+2016），也不是单根竖线。每个开始标记都有对应的 `/` 结束标记：
 
+```go
+// 形状（PIPE = markupPipe = "\uFF5C\uFF5C"）
+//   <PIPE>DSML<PIPE> calls>          … </PIPE>DSML<PIPE> calls>
+//   <PIPE>DSML<PIPE> invoke name="X"> … </PIPE>DSML<PIPE> invoke>
+//   <PIPE>DSML<PIPE> parameter name="k" string="true">v </PIPE>DSML<PIPE> parameter>
+const (
+	markupOpen        = "<"  + markupPipe + "DSML" + markupPipe + " calls>"
+	markupClose       = "</" + markupPipe + "DSML" + markupPipe + " calls>"
+	markupInvokeClose = "</" + markupPipe + "DSML" + markupPipe + " invoke>"
+	markupParamClose  = "</" + markupPipe + "DSML" + markupPipe + " parameter>"
+)
 ```
-<‖DSML‖ calls><‖DSML‖ invoke name="X"><‖DSML‖ parameter name="k" string="true">v<‖DSML‖ parameter>…
+
+**做夹具不要手打竖线**（本文件也刻意不再内联渲染字形）：从 `internal/upstream/testdata/leaked_markup.txt` 取真实样本，或用下面这段拼接出字节精确的完整块：
+
+```go
+p := "\uFF5C\uFF5C"
+block := "<" + p + "DSML" + p + " calls>" +
+	"<" + p + "DSML" + p + ` invoke name="read_file">` +
+	"<" + p + "DSML" + p + ` parameter name="path" string="true">/etc/hosts` +
+	"</" + p + "DSML" + p + " parameter>" +
+	"</" + p + "DSML" + p + " invoke>" +
+	"</" + p + "DSML" + p + " calls>"
 ```
+
+手敲的 `‖`（U+2016）、单根竖线、或漏掉 `/` 的结束标记都不会命中修复器——测出来的"没修好"是假阴性。
+
+解析器硬前提（`parseMarkupBlock` / `parseMarkupParams`）：块内除 `invoke` 与空白外不能有其它字节、每个 `invoke` 必须闭合、每个 `parameter` 必须闭合、`string="true"` 取值按原文、其余按 JSON 解析（失败退化为字符串）。
 
 还原规则：
 

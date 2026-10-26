@@ -58,7 +58,10 @@ Cross-Origin-Resource-Policy: same-origin
 - 密钥从 `livecfg` 快照读（`p.apiKey()`），所以面板里改完立即生效、不用重启。
 - **`api_key` 为空 = 面板无鉴权**。这是给 localhost / 内网用的便利，公网部署必须设置密钥（README 安全章节也这么写）。
 - 没有密码登录、没有会话 cookie、没有 CSRF token 机制。缓解手段是：CSP + `form-action 'none'` + Bearer 放在 `localStorage` + 同源限制。**不要**引入 cookie 鉴权，那会立刻需要 CSRF 防护。
-- 面板 API 的错误体固定 `{"ok":false,"error":"…"}`；成功响应一律带 `"ok": true`。
+- 错误体统一 `{"ok":false,"error":"…"}`；**成功响应没有统一的 `ok:true` 契约**：
+  - 写操作/需要回执的接口带 `ok`（如 `POST /panel/api/config` 回 `{ok:true, restart_required:[…]}`、密钥创建回 `{ok:true, key:…}`）；
+  - 只读接口直接返回数据体（`GET /panel/api/overview` 就是 `{version, uptime_sec, …}`，没有 `ok` 字段）；
+  - 前端 `api()` 以 **HTTP 状态**判成功，从不读 `d.ok`。所以新增只读接口不要硬加 `ok`，新增写接口可以带；**也不要**在前端加 `if (!d.ok) throw`——会把现有只读接口全部判失败。
 
 ## 改动清单
 

@@ -172,18 +172,26 @@ git config --global user.signingkey <key-id|ssh-key-path>
 
 ## 6. 什么不该提交（本仓库特有）
 
-`.gitignore` 的真实规则里有两个陷阱：
+当前 `.gitignore` 的相关规则（`git check-ignore -v <path>` 可复核）：
 
-1. **`*.md` 被全局忽略，只放行 `README.md`**。所以新建的文档（包括 `.trellis/spec/**/*.md`）默认**进不了版本库**：
-   - `.trellis/spec/**/*.md` 已加例外规则；
-   - 其它一次性文档要么加规则，要么 `git add -f <path>`（`internal/prompt/defaultprompt.md` 就是这样进来的）。
-2. **根目录运行产物没有完整规则**：`wb2api.exe` 已忽略，但 `wb2api.exe~`（编辑器备份）、`auths.zip`、`.diffdump/`、`.diffscratch/` 都没有规则。
+| 规则 | 效果 |
+|------|------|
+| `auths/`、`data/`、`config.json`、`*.key`、`*.pem`、`.env*`、`backups/` | 凭证与运行状态，永不入库 |
+| `*.md` + `!README.md` + `!.trellis/**/*.md` | **`.trellis` 下的 markdown（spec / tasks / workflow / agents）可入库**；`.trellis` 之外的 `*.md` 仍被忽略 |
+| `*.zip`、`/wb2api.exe`、`/login.exe`、`/credit.exe`、`/login`…（根目录锚定） | 二进制与发布包 |
+| `*~`、`/.diffdump/`、`/.diffscratch/` | 编辑器备份与本地临时目录 |
+| `docs/`、`LOOP.md`、`PLAN.md`、`SPEC.md`、`/cmd/desktopverify*/`、`server.exe` | 本地设计文档与验证工具 |
+
+仍然存在的两个陷阱：
+
+1. **`.trellis` 之外的 markdown 进不了库**：根目录设计文档、`.github/pull_request_template.md`、`docs/**` 都在忽略范围内。要么加一条 `!` 规则，要么 `git add -f <path>`（`internal/prompt/defaultprompt.md` 就是被强制加入的）。
+2. **只覆盖了 `~` 结尾的备份**：`wb2api.exe.bak`、`*.orig`、`*.rej` 之类没有规则。`git add -A` 会把它们一起带进去。
 
 因此：
 
-- **禁止 `git add -A` / `git add .` / `git commit -a`**。一律显式列路径：`git add internal/pool/cooldown.go internal/pool/modelcooldown_test.go`。
-- 提交前 `git status --porcelain` 逐条过；看到 `auths/`、`data/`、`config.json`、`*.zip`、`*~` 一律不加。
-- `auths/` 存的是**明文** access/refresh token，误提交等于交出账号。
+- **禁止 `git add -A` / `git add .` / `git commit -a`**。一律显式列路径：`git add internal/pool/cooldown.go internal/pool/modelcooldown_test.go`。理由是规则只能挡住"想到过的"路径，而 `auths/` 里是**明文** access/refresh token——漏一条就是交出账号。
+- 提交前 `git status --porcelain` 逐条过，再用 `git check-ignore -v <路径>` 确认"以为被忽略"的文件真的被忽略。
+- 新增一类本地产物时，先补 `.gitignore` 规则再动手，不要依赖 `git add` 时的自觉。
 
 行尾：`.gitattributes` 强制 `*.sh` / `Dockerfile` / `*.yml` / `*.yaml` 用 LF——CRLF 会让容器里 shebang 变成 `/bin/bash^M` 而直接启动失败。Windows 上编辑这些文件后要确认 `git diff` 没有整文件行尾翻转。
 
