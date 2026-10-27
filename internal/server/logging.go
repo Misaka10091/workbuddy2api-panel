@@ -70,6 +70,12 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// 工具调用观测（issue #44）：声明数来自请求体 tools/functions，调用数来自上游
+	// 响应（流式按 delta.tool_calls[].index 去重 + 标记还原数；非流式按
+	// message.tool_calls + 还原数）。只记数量，不记名字与参数。
+	toolsDeclared int
+	toolCalls     int
+
 	logged bool
 }
 
@@ -117,6 +123,8 @@ type chatStatsReader struct {
 	cacheMiss    int
 	hasCacheMiss bool
 	pend         []byte // 已读未返回的行缓存
+	// toolIdx 流中观测到的 tool_calls index 集合（去重后即调用条数）。
+	toolIdx map[int]bool
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -163,7 +171,14 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.ttfb = time.Since(s.start)
 	}
 	var chunk struct {
-		Error json.RawMessage `json:"error"`
+		Error   json.RawMessage `json:"error"`
+		Choices []struct {
+			Delta struct {
+				ToolCalls []struct {
+					Index *int `json:"index"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
 		Usage *struct {
 			PromptTokens         *int     `json:"prompt_tokens"`
 			CompletionTokens     *int     `json:"completion_tokens"`
@@ -173,14 +188,26 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
-			s.errorFrame = true
-		}
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 		return
 	}
 	if len(chunk.Error) > 0 {
 		s.errorFrame = true
+	}
+	// 工具调用计数：同一 index 的多个碎片帧只算一次（delta 分片是 OpenAI 流式常态）。
+	for _, ch := range chunk.Choices {
+		for _, tc := range ch.Delta.ToolCalls {
+			if tc.Index == nil {
+				continue
+			}
+			if s.toolIdx == nil {
+				s.toolIdx = make(map[int]bool, 4)
+			}
+			s.toolIdx[*tc.Index] = true
+		}
+	}
+	if chunk.Usage == nil {
+		return
 	}
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
@@ -227,6 +254,34 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。
 func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
+
+// ToolCalls 返回流中观测到的结构化工具调用条数（按 delta.tool_calls[].index 去重）。
+func (s *chatStatsReader) ToolCalls() int { return len(s.toolIdx) }
+
+// countResponseToolCalls 统计非流式聚合响应里 message.tool_calls 的条数。
+// Aggregate 自己组包，message.tool_calls 是 []map[string]any；直解上游 JSON 才是
+// []any。这里按 []any 统一处理（组包后经 JSON 往返两者都可能出现）。
+func countResponseToolCalls(resp map[string]any) int {
+	choices, _ := resp["choices"].([]any)
+	n := 0
+	for _, c := range choices {
+		cm, _ := c.(map[string]any)
+		if cm == nil {
+			continue
+		}
+		msg, _ := cm["message"].(map[string]any)
+		if msg == nil {
+			continue
+		}
+		switch calls := msg["tool_calls"].(type) {
+		case []any:
+			n += len(calls)
+		case []map[string]any:
+			n += len(calls)
+		}
+	}
+	return n
+}
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
@@ -422,6 +477,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.ToolsDeclared = s.toolsDeclared
+		e.ToolCalls = s.toolCalls
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

@@ -29,11 +29,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -75,6 +78,17 @@ func desktopUAFor(a *auth.Auth) string {
 	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + defaultCliVersion
 }
 
+// desktopHost 返回 X-Domain 用的裸主机名（与真机一致：www.workbuddy.ai /
+// copilot.tencent.com）。从 base 里剥 scheme 与路径；解析失败时退回 base 原串，
+// 保证不会因为 URL 畸形而把该头发成空串（头缺失同样会触发渠道校验）。
+func (c *Client) desktopHost(a *auth.Auth) string {
+	base := c.desktopBase(a)
+	if u, err := url.Parse(base); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
+}
+
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
@@ -86,10 +100,11 @@ func deriveID(a *auth.Auth, salt string) string {
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
+// 版本三元组按 realm 取（见 desktopTriple）；qimei36 仅国内版有（见下）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
 	ver, commit, release := desktopTriple(a)
-	return map[string]any{
+	fp := map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
 		"userId":       a.UID,
@@ -107,12 +122,23 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
-		"timestamp":    now,
-		"presentAt":    now,
+		// osVersion / cpuModel / cpuCores / memorySize 是真机上报名（5.8.4 实测）：
+		// 这些字段上游侧用于设备侧写，缺 cpuModel 是最明显的「非桌面端」特征。
+		"osVersion":  "10.0.28000",
+		"cpuModel":   "11th Gen Intel(R) Core(TM) i5-11320H @ 3.20GHz",
+		"cpuCores":   8,
+		"memorySize": 16,
+		"timestamp":  now,
+		"presentAt":  now,
 	}
+	// qimei36：腾讯设备标识（36 位小写十六进制）。2026-10-20 双版本抓包实测——
+	// 国内版每个 report 事件都带，国际版**一条都不带**（CN 28 键 vs GL 27 键，
+	// 差集恰好只有 qimei36）。故按 realm 条件注入：给国际版补这个键反而是伪造。
+	// 取值按 uid 稳定派生（同 deriveID 口径），保证同号跨重启恒同值。
+	if a != nil && !a.IsGlobal() {
+		fp["qimei36"] = deriveID(a, "qimei")
+	}
+	return fp
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 www.workbuddy.cn/v2/report 批量上报事件。
@@ -146,9 +172,13 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUAFor(a))
-	req.Header.Set("X-Domain", c.desktopBase(a))
+	// X-Domain 是**主机名**不是 URL：真机实测 `X-Domain: www.workbuddy.ai`，
+	// 而 desktopBase 返回的是带 scheme 的 base，直接塞进去会发成
+	// `https://www.workbuddy.ai`——与本仓其它头（chat/billing 用裸域）也不自洽，
+	// 是最容易被上游按「非客户端形态」识别出来的一处。
+	req.Header.Set("X-Domain", c.desktopHost(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
@@ -447,7 +477,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	// 会话 ID 用官方形态（v4 UUID）。旧实现是 `wb2api-conv-<UnixNano>`——项目缩写 +
+	// 纳秒时间戳直接当 X-Conversation-ID 打给上游，是 issue #51 里最直白的一处自证。
+	conversationID = session.NewConversationID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -467,26 +499,16 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	h := req.Header
-	// 桌面端版本段按 realm 取（与上报体/UA 同源，避免版本段彼此不一致）。
-	ideVer, _, _ := desktopTriple(a)
-	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUAFor(a))
-	h.Set("X-Domain", c.chatBase(a))
-	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
-	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", ideVer)
-	h.Set("x-codebuddy-request", "1")
+	// 头族一律走 ChatHeaders：这条路径原先手搓了 20 多行头，结果与主 chat 路径长期漂移
+	// （缺 X-Trace-ID / X-B3-* / x-stainless-* / acp-connection-id，X-Request-ID 还是
+	// 十进制纳秒）。手搓头本身就是漂移的根因——统一出口后主路径改一次这里自动跟随。
+	c.ChatHeaders(req, a, "", ChatMeta{
+		ConversationID:        conversationID,
+		CacheKeyID:            conversationID,
+		ConversationRequestID: session.NewMessageID(),
+	})
 	if expertID != "" {
-		h.Set("X-Expert-Id", expertID)
+		req.Header.Set("X-Expert-Id", expertID)
 	}
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
 		fmt.Printf("[dbg] URL=%s\n", req.URL)

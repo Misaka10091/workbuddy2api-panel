@@ -1,11 +1,20 @@
-# syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
+# 版本要素（面板左上角展示）：BUILD_VERSION 非空（在 tag 上构建）→ 原样展示 tag；
+# 否则 server 自己拼「构建时间 + 提交短 hash」。构建镜像里没有 git、.git 也被
+# .dockerignore 排除，hash 只能跟着 build-arg 进来；BUILD_COMMIT 为空时版本串
+# 只剩构建时间（不会编一个假 hash）。
+ARG BUILD_VERSION=""
+ARG BUILD_COMMIT=""
+ARG BUILD_TIME=""
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+RUN set -eux; \
+    [ -n "$BUILD_TIME" ] || BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ); \
+    LDF="-s -w -X main.buildVersion=$BUILD_VERSION -X main.buildCommit=$BUILD_COMMIT -X main.buildTime=$BUILD_TIME"; \
+    CGO_ENABLED=0 go build -trimpath -ldflags="$LDF" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit

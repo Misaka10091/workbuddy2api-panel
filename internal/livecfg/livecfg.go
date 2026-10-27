@@ -19,6 +19,9 @@ type Snapshot struct {
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	// AllowedModels 网关级模型白名单（config models.allowed）：空 = 不启用。
+	// 条目语法：裸名 = 两域可见；"cn:xxx"/"global:xxx" = 只该域可见。
+	AllowedModels []string
 }
 
 // Holder 原子持有当前快照。

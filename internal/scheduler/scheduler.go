@@ -5,7 +5,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -61,6 +61,16 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// AccountSpreadMinutes 账号遍历型任务的摊开窗口（分钟）。0 = 关闭（同一秒打全池，
+	// 旧行为）；>0 时每个账号在窗口内按 hash(任务|uid|日) 的偏移执行（spread.go）。
+	AccountSpreadMinutes int
+	// AccountSpreadMinGapSeconds 摊开窗口内相邻账号的最小间隔（秒），冲突时把靠后的
+	// 账号推开。0 = 不推开。
+	AccountSpreadMinGapSeconds int
+	// NightChatCap 夜猫子单轮参与账号数上限（0 = 不限）。按 hash(日|uid) 轮换参与，
+	// 避免同一批账号每天熬夜、其余账号永远不参与。
+	NightChatCap int
 }
 
 // Scheduler 调度器。
@@ -100,6 +110,17 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
+	}
+	// 摊开参数由 config 提供（生产默认 20 分钟 / 30 秒 / 夜猫子 3 个）；零值即关闭，
+	// 便于测试与「显式关掉」的部署。只把负值归零，避免负窗口产生反向等待。
+	if cfg.AccountSpreadMinutes < 0 {
+		cfg.AccountSpreadMinutes = 0
+	}
+	if cfg.AccountSpreadMinGapSeconds < 0 {
+		cfg.AccountSpreadMinGapSeconds = 0
+	}
+	if cfg.NightChatCap < 0 {
+		cfg.NightChatCap = 0
 	}
 	return &Scheduler{
 		cfg:           cfg,
@@ -402,15 +423,15 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.runCheckin(ctx, "", true)
 			case taskTravel:
-				s.RunTravelNow()
+				s.runTravel(ctx, "", true)
 			case taskActivity:
-				s.runActivity(ctx, "")
+				s.runActivity(ctx, "", true)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runKeepalive(ctx, "", true)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.runBlackcat(ctx, "", true)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -458,10 +479,19 @@ func (s *Scheduler) RunCheckinNow() { s.RunCheckinRealm("") }
 // 被跳过（此谓词与域作用域无关，见下方 D4 门控），企业版仍然跳过签到但照常
 // 查额度。作用域只决定「遍历哪些账号」。
 func (s *Scheduler) RunCheckinRealm(realm string) {
-	realm = normalizeRealm(realm)
+	s.runCheckin(context.Background(), normalizeRealm(realm), false)
+}
+
+// runCheckin 签到实现。spreadOn=true（排程触发）时按账号摊开计划错峰；false（面板
+// 手动触发）立即跑完。ctx 取消立即退出，不等摊开睡满。
+func (s *Scheduler) runCheckin(ctx context.Context, realm string, spreadOn bool) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	plan := s.spreadPlan(taskCheckin, spreadOn, time.Now())
+	for _, st := range plan.order(s.cfg.Pool.List()) {
+		if !plan.wait(ctx, st.UID) {
+			return // 优雅停机：剩余账号下轮再跑
+		}
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -524,20 +554,25 @@ func (s *Scheduler) RunCheckinRealm(realm string) {
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 // 等价于 RunActivityRealm("")（全池，既有行为）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background(), "")
+	s.runActivity(context.Background(), "", false)
 }
 
 // RunActivityRealm 活跃上报，仅作用于指定域（"cn"/"global"）的账号；
 // realm=="" 等价于全池。同步执行（面板批量按钮等它跑完再回报）。
 func (s *Scheduler) RunActivityRealm(realm string) {
-	s.runActivity(context.Background(), normalizeRealm(realm))
+	s.runActivity(context.Background(), normalizeRealm(realm), false)
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出；realm 为域作用域（""=全池）。
-func (s *Scheduler) runActivity(ctx context.Context, realm string) {
+// spreadOn=true（排程触发）时按账号摊开计划错峰，手动入口不摊开。
+func (s *Scheduler) runActivity(ctx context.Context, realm string, spreadOn bool) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	plan := s.spreadPlan(taskActivity, spreadOn, time.Now())
+	for _, st := range plan.order(s.cfg.Pool.List()) {
+		if !plan.wait(ctx, st.UID) {
+			return
+		}
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -566,7 +601,7 @@ func (s *Scheduler) runActivity(ctx context.Context, realm string) {
 			}
 		}
 		first = false
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
+		cid := session.NewConversationID()
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			continue
@@ -609,9 +644,18 @@ func (s *Scheduler) RunKeepaliveNow() { s.RunKeepaliveRealm("") }
 // RunKeepaliveRealm token 保活，仅作用于指定域（"cn"/"global"）的账号；
 // realm=="" 等价于全池（RunKeepaliveNow 的现状语义）。
 func (s *Scheduler) RunKeepaliveRealm(realm string) {
-	realm = normalizeRealm(realm)
+	s.runKeepalive(context.Background(), normalizeRealm(realm), false)
+}
+
+// runKeepalive token 保活遍历。spreadOn=true（排程触发）时按账号摊开计划错峰，
+// 避免多号同一秒刷新（同一出口 IP 的固定节拍是可识别的机器形状）。
+func (s *Scheduler) runKeepalive(ctx context.Context, realm string, spreadOn bool) {
 	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
+	plan := s.spreadPlan(taskKeepalive, spreadOn, time.Now())
+	for _, st := range plan.order(s.cfg.Pool.List()) {
+		if !plan.wait(ctx, st.UID) {
+			return
+		}
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -652,10 +696,20 @@ func (s *Scheduler) RunBalanceRefreshNow() { s.RunBalanceRefreshRealm("") }
 // RunBalanceRefreshRealm 余额刷新，仅作用于指定域（"cn"/"global"）的账号；
 // realm=="" 等价于全池（RunBalanceRefreshNow 的现状语义）。
 func (s *Scheduler) RunBalanceRefreshRealm(realm string) {
-	realm = normalizeRealm(realm)
+	s.runBalanceRefresh(normalizeRealm(realm), false)
+}
+
+// runBalanceRefresh 余额刷新实现。stagger=true（后台周期触发）时给每个账号一个
+// 窗口内独立偏移：一天几百轮若每轮都同序并发打上游，固定节拍本身就是机器形状。
+// 手动入口（面板全量刷新）不 stagger，保持「点了就跑完」的既有语义。
+func (s *Scheduler) runBalanceRefresh(realm string, stagger bool) {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	staggerWin := time.Duration(0)
+	if stagger {
+		staggerWin = spreadIntervalStagger(time.Duration(s.balanceInterval.Load()), 0.2)
+	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
@@ -668,8 +722,11 @@ func (s *Scheduler) RunBalanceRefreshRealm(realm string) {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, delay time.Duration) {
 			defer wg.Done()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
@@ -677,7 +734,7 @@ func (s *Scheduler) RunBalanceRefreshRealm(realm string) {
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-		}(a, st.UID)
+		}(a, st.UID, spreadStaggerDelay(staggerWin, st.UID))
 	}
 	wg.Wait()
 }
@@ -708,7 +765,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 					continue
 				}
 			}
-			timer := time.NewTimer(cur)
+			timer := time.NewTimer(cur + periodicJitter(cur, 0.15, "balance"))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -716,7 +773,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				s.runBalanceRefresh("", true)
 			}
 		}
 	}()
@@ -729,4 +786,23 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	}
 	s.balanceInterval.Store(int64(d))
 	poke(s.rearmBalance)
+}
+
+// SetAccountSpread 热改账号摊开窗口 / 最小间隔与夜猫子单轮上限（面板保存配置）。
+// 0 = 关闭对应项；负值归零。摊开只改「什么时候做」，不改任何业务判据。
+func (s *Scheduler) SetAccountSpread(minutes, gapSeconds, nightCap int) {
+	if minutes < 0 {
+		minutes = 0
+	}
+	if gapSeconds < 0 {
+		gapSeconds = 0
+	}
+	if nightCap < 0 {
+		nightCap = 0
+	}
+	s.schedMu.Lock()
+	s.cfg.AccountSpreadMinutes = minutes
+	s.cfg.AccountSpreadMinGapSeconds = gapSeconds
+	s.cfg.NightChatCap = nightCap
+	s.schedMu.Unlock()
 }

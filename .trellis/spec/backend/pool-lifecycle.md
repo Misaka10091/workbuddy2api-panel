@@ -145,6 +145,26 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 - `paused` 只被黑猫跳过（它是唯一发真实对话的任务），其余保号任务对 paused 账号照跑。
 - **同槽任务没有账号级互斥**，一个号可能同时被签到与活跃打到；需要串行的场景只能靠"同槽不同 kind 分属不同 goroutine + 上游自身幂等"。
 
+## 状态落盘与时间形状（2026-10 加固）
+
+**落盘脏标记（`p.dirty`）不是可选项**：任何改变持久化字段的写入口都要 `dirty.Store(true)`。
+12153 连续计数曾只在「达阈值禁用」时置脏——阈值内 `+1` 与三处清零点都不置脏，重启后
+旧计数复活，刚被 refresh 证明存活的账号下次失败被直接推到阈值（上游 `0ebd6e7` 同口径）。
+判断标准：`stateAccount` 里有对应字段（`session_dead_fails`）就必须置脏。
+
+**粘性 `touch` 必须 CAS**：`Router.touch` 在写锁内核对 `entries[key].uid` 仍是入参 uid
+才滚动 `lastActive`，否则放弃本次 touch。快路径 `RUnlock` 到加写锁的窗口里，
+失败路径 `Unbind` / 成功路径 `Bind` / 慢路径重分配都可能已改写绑定；无条件回写会
+复活刚解绑的失败号、把粘性跟随的成功号冲回旧号，镜像进 Redis 后连重启都恢复成错绑定。
+
+**账号摊开（`spread.go`）**：排程触发的账号遍历任务先取 `spreadPlan(kind, true, now)`，
+按 `hash(任务|uid|CST日)` 在窗口内定偏移、冲突按最小间隔推开、遍历按计划时刻排序
+（**不能按 `Pool.List()` 的 uid 序**：排在前面的账号计划更晚时，后面的会被逐个堵住、
+最后挤在末尾同一秒跑完）。手动入口 `on=false` 恒不摊开。余额刷新走另一套
+`periodicJitter` + `spreadStaggerDelay`（按周期重算，避免「每轮第 i 个账号」固定落位）。
+夜猫子另受 `NightChatCap` 约束（按 `hash(日|uid)` 轮换参与，避免同一批账号每天熬夜）。
+三项都只改「什么时候做」，不改业务判据；配置 0 即恢复旧行为。
+
 ## 测试约定
 
 - 没有假时钟。确定性靠四招：把截止时间**回拨**（`expireCooldown` 直接改 `e.until = now-1s`）、容差断言（`wantCoolSec`）、注入 RNG（`SetRandomSource(func(int64) int64 { return 0 })`）、关掉 `minPickGap`（`withNoPickGap`）。

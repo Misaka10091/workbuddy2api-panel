@@ -52,14 +52,14 @@ paths:
 | `login.sh` | 完整登录 → 落盘 → 重启容器 | 无 `./login` 时先构建 → `login url` → 复制到剪贴板 → 交互确认 → `login poll` → python3 逐字段解析 → **通过环境变量**把值传给签到 heredoc（避免注入）→ 写 `auths/workbuddy-<uid>.json` → `docker restart` + `/status` 校验 |
 | `signin.sh` | 批量签到 | 无 `./signin_bin` 时先构建，再 exec |
 | `credit.sh` | 余额 | **不构建**，直接 exec `./credit`（需预构建） |
-| `scripts/docker.sh` | 本地镜像/容器 | 子命令 `env\|build\|up\|run\|push\|down\|stop\|restart\|logs\|ps\|pull\|compose\|help`；默认值与 `docker-compose.yml` 必须一致（镜像 `misaka10092/workbuddy2api-panel`、tag `latest`、端口 7863、容器名 `workbuddy2api`） |
+| `scripts/docker.sh` | 本地镜像/容器 | 子命令 `env\|build\|up\|run\|push\|down\|stop\|restart\|logs\|ps\|pull\|compose\|help`；默认值与 `docker-compose.yml` 必须一致（镜像 `misaka10092/workbuddy2api-panel`、tag `latest`、端口 7863、容器名 `workbuddy2api`）；`build`/`up` 自动算好版本要素（tag / 提交 / 构建时刻）当 build-arg 传进去 |
 
 两条路径别混淆：**面板"添加账号"是热加载进池（免重启）**；`login.sh` 走的是**重启容器**加载。
 
 ## 镜像（`Dockerfile` / `docker-compose.yml`）
 
 - 两阶段：`golang:1.23-alpine` 构建 → `alpine:3.20` 运行。
-- 四个二进制在一次 `RUN` 里编出来，统一 `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`。
+- 四个二进制在一次 `RUN` 里编出来，统一 `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`；`wb2api` 另外注入版本要素（build-arg `BUILD_VERSION` / `BUILD_COMMIT` / `BUILD_TIME`）。镜像里没有 `.git`（`.dockerignore` 排除 + 构建镜像不装 git），hash 只能从外面传；`BUILD_TIME` 缺省取构建时刻。
 - 运行阶段装 `wget ca-certificates tzdata python3 bash`，创建 uid 10001 的 `app` 用户。
 - 脚本拷进去后用 `sed -i 's/\r$//'` 去 CRLF（Windows 检出），**必须在对 `app` 切换用户之前以 root 执行**——`app` 对 root 拥有的文件无写权限。
 - 镜像不带真实配置：`config.example.json` 作为 `/app/config.json` 的默认；生产靠挂载覆盖。
@@ -68,9 +68,9 @@ paths:
 
 ## 发布
 
-- 版本常量、tag 规则、`-s -w` 口径见 [quality-and-testing.md](./quality-and-testing.md)。
-- `.github/workflows/docker-ghcr.yml`：多架构（amd64/arm64）推 GHCR，`latest` + semver + sha tag，`provenance: false`（避免 ghcr 出现 unknown 架构条目），PR 只构建不推。
-- `.github/workflows/go-binaries.yml`：`test` → 五平台交叉编译 → 断言二进制含 `appVersion` → 打包（Windows 三件套 zip，其余 tar.gz）→ tag 触发时生成 checksums 并发 Release。
+- 版本串来源、tag 规则、`-s -w` 口径见 [quality-and-testing.md](./quality-and-testing.md)。
+- `.github/workflows/docker-ghcr.yml`：多架构（amd64/arm64）推 GHCR，`latest` + semver + sha tag，`provenance: false`（避免 ghcr 出现 unknown 架构条目），PR 只构建不推；按 ref 类型传版本要素（tag 构建传 tag，其余只传提交号 + 构建时刻）。
+- `.github/workflows/go-binaries.yml`：`test` → 五平台交叉编译（注入版本要素）→ 断言产物含 tag（tag 构建）/ 本次提交号（所有构建）→ 打包（Windows 三件套 zip，其余 tar.gz）→ tag 触发时生成 checksums 并发 Release。
 - 本地产物 `wb2api.exe` 及其编辑器备份 `wb2api.exe~`、`auths.zip` 在仓库根目录是**运行产物，不是源码**，不要提交也不要当参考实现。
 
 ## 反模式

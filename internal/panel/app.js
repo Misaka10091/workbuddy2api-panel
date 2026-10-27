@@ -691,8 +691,14 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
+    // 版本串由服务端拼好（tag 构建 = tag 名，其余 = 构建时间 + 提交短 hash），
+    // 这里只原样展示：再补一个 'v' 前缀会把 tag 显示成 vv2026.…。
+    // 侧栏只有 208px，超长时由 CSS 省略号截断，完整串放 title 里悬停可见。
+    const ver = d.version || 'dev';
+    $('navSub').textContent = ver;
+    $('navSub').title = '版本号 ' + ver;
+    $('navVer').textContent = ver;
+    $('navVer').title = '版本号 ' + ver;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
@@ -1418,12 +1424,14 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
-async function loadModels() {
+// force=true（点「重新获取」按钮）时带 refresh=1 绕过服务端 60s 短缓存；
+// 切视图/首次加载走缓存，避免每进一次页面就打一轮上游。
+async function loadModels(force) {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = await Promise.all([api('models' + (force ? '?refresh=1' : '')), api('model_probes').catch(() => ({}))]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
     if (!mdAll.length) {
@@ -1564,7 +1572,7 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
 }
 $('mdReset').onclick = resetModelFilter;
-$('btnModels').onclick = loadModels;
+$('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';

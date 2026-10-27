@@ -82,8 +82,14 @@ type Event struct {
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	// ToolsDeclared / ToolCalls 本次请求声明的工具数与实际产出的工具调用数。
+	// 二者只记数量，不记工具名与参数。tools_declared>0 且 tool_calls==0 即一次
+	// 「零工具调用收尾」——agent 客户端每轮都声明 tools，正常收尾与上游静默丢调用
+	// 在线上不可区分，只能靠这个比率观测（issue #44）。
+	ToolsDeclared int       `json:"tools_declared,omitempty"`
+	ToolCalls     int       `json:"tool_calls,omitempty"`
+	ClientIP      string    `json:"client_ip,omitempty"`
+	UserAgent     string    `json:"user_agent,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

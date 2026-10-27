@@ -10,10 +10,12 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,9 +32,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
-
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -51,6 +50,9 @@ func stateSibling(stateFile, name string) string {
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+
+	// 版本号最先打：面板左上角展示的就是这一串，排障时先确认"跑的是哪个二进制"。
+	log.Printf("[version] %s", versionLine())
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -150,6 +152,7 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeBrandAll.Store(cfg.Features.SanitizeBrandScope != "identity")
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -192,6 +195,10 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 账号摊开与夜猫子上限（只错开时刻，不改业务判据）。
+		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
+		NightChatCap:               cfg.Schedule.NightChatCap,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -240,6 +247,7 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		AllowedModels:        cfg.Models.Allowed,
 	})
 	// 多密钥表（每个密钥可绑定国内版 / 国际版）。
 	// 非法条目跳过并记 WARN：一条脏密钥不该让正在服务的网关拒绝启动。
@@ -338,6 +346,11 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 网关级模型白名单与积分闸（静态装配；Live 里的 AllowedModels 优先）。
+		AllowedModels:      cfg.Models.Allowed,
+		BudgetLimit:        cfg.Budget.DailyLimit,
+		BudgetBurst:        cfg.Budget.BurstLimit,
+		BudgetCacheLowRate: cfg.Budget.CacheLowRate,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -376,6 +389,9 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
+	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
@@ -394,6 +410,32 @@ func applyCNChatBase(up *upstream.Client, cfg *Config) {
 	if cfg.CN.ChatBase != "" {
 		up.ChatBaseCN = cfg.CN.ChatBase
 	}
+}
+
+// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
+// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（缺省 ":7863" 绑
+// 所有网卡）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
+// 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
+// 显式清空」的最后提醒，不阻塞启动（安全加固最小版：只提醒，不改行为）。
+func insecureKeyWarning(listen, apiKey string) string {
+	if apiKey != "" && apiKey != "test_key" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen // 非 host:port 形态：按具名地址保守处理（继续告警）
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		// 空 host = 所有网卡，维持告警
+	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
+		return "" // 只听回环：暴露面有限，不打扰
+	}
+	what := "为空（网关与面板完全不鉴权）"
+	if apiKey != "" {
+		what = "为样例占位符 test_key"
+	}
+	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
@@ -525,8 +567,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		AllowedModels:        newCfg.Models.Allowed,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeBrandAll.Store(newCfg.Features.SanitizeBrandScope != "identity")
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -546,6 +590,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetAccountSpread(
+		newCfg.Schedule.AccountSpreadMinutes,
+		newCfg.Schedule.AccountSpreadMinGapSeconds,
+		newCfg.Schedule.NightChatCap)
 	// 密钥表热替换：整表原子换掉（校验失败条目跳过并记 WARN，不阻断保存——
 	// 用户改的是别的字段时不该因为一条密钥拼错就整份配置存不下去）。
 	if keys != nil {
@@ -589,6 +637,17 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// 积分闸在 NewHandler 里装配成 dailyBudget 快照，保存配置不重建 handler，
+	// 因此按装配期字段处理（>0 才提示；0 = 关闭时改 0 本来也无副作用）。
+	if c.Budget.DailyLimit > 0 {
+		out = append(out, "budget.daily_limit")
+	}
+	if c.Budget.BurstLimit > 0 {
+		out = append(out, "budget.burst_limit")
+	}
+	if c.Budget.CacheLowRate > 0 {
+		out = append(out, "budget.cache_low_rate")
+	}
 	return out
 }
 

@@ -52,6 +52,17 @@ type Config struct {
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
 
+	// AllowedModels 网关级模型白名单静态值（Live 优先；空 = 不启用）。
+	// 条目语法：裸名 = 两域；"cn:xxx"/"global:xxx" = 只该域。
+	AllowedModels []string
+
+	// BudgetLimit 当日累计积分上限（>0 启用；0 = 关闭）。
+	BudgetLimit float64
+	// BudgetBurst 5 分钟突发积分闸（>0 启用；0 = 关闭）。
+	BudgetBurst float64
+	// BudgetCacheLowRate 连续低缓存率闸阈值（百分比；0 = 关闭）。
+	BudgetCacheLowRate float64
+
 	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
@@ -128,6 +139,9 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+
+	// budget 积分闸（budget.go）：当日上限 / 突发窗口 / 连续低缓存率。nil = 未启用。
+	budget *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -145,6 +159,10 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	if cfg.BudgetLimit > 0 || cfg.BudgetBurst > 0 || cfg.BudgetCacheLowRate > 0 {
+		h.budget = newDailyBudget(cfg.BudgetLimit)
+		h.budget.setGuards(cfg.BudgetBurst, cfg.BudgetCacheLowRate)
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -394,11 +412,14 @@ const (
 //  3. 空列表也照常 200：客户端据此知道「当前没有可用模型」，而不是去猜。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	scope := scopeFrom(r)
+	// 网关级白名单先在「两域并列、带前缀」的原始目录上过滤，再按密钥域拆前缀：
+	// 反过来的话单域视图里 id 已无前缀，无法区分 cn:xxx 与 global:xxx。
+	all := filterModelsByAllowed(h.modelList(), h.allowedModels())
 	var list []map[string]any
 	if scope.Realm != "" {
-		list = h.modelListForRealm(scope.Realm)
+		list = filterEntriesByRealm(all, scope.Realm)
 	} else {
-		list = h.modelList()
+		list = all
 	}
 	list = filterModelsByKey(list, scope.Models)
 	if list == nil {
@@ -423,6 +444,69 @@ func filterModelsByKey(list []map[string]any, filter *apikeys.ModelFilter) []map
 	for _, entry := range list {
 		id, _ := entry["id"].(string)
 		if filter.Allows(id) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// allowedModels 生效的网关级模型白名单；空 = 不启用（Live 优先于静态字段）。
+func (h *Handler) allowedModels() []string {
+	if h == nil {
+		return nil
+	}
+	if h.cfg.Live != nil {
+		if a := h.cfg.Live.Load().AllowedModels; len(a) > 0 {
+			return a
+		}
+	}
+	return h.cfg.AllowedModels
+}
+
+// modelAllowed 判定 (realm, 裸模型名) 是否在白名单内；空名单放行。
+// 条目语法：裸名 = 两域；"cn:xxx"/"global:xxx" = 只该域；大小写敏感。
+func (h *Handler) modelAllowed(realm, model string) bool {
+	allow := h.allowedModels()
+	if len(allow) == 0 {
+		return true
+	}
+	return allowedIn(allow, realm, model)
+}
+
+// allowedIn 白名单判定核心（纯函数，供列表与入口共用，保证两处口径一致）。
+// 空名单 = 不启用（放行）。
+func allowedIn(allow []string, realm, model string) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	for _, e := range allow {
+		if r, m, ok := strings.Cut(e, ":"); ok && (r == "cn" || r == "global") {
+			if m == model && (realm == "" || r == realm) {
+				return true
+			}
+			continue
+		}
+		if e == model {
+			return true
+		}
+	}
+	return false
+}
+
+// filterModelsByAllowed 按网关级白名单过滤列表条目（id 可能带 "cn:"/"global:" 前缀）。
+// 空名单原样返回同一片段（零开销）。
+func filterModelsByAllowed(list []map[string]any, allow []string) []map[string]any {
+	if len(allow) == 0 {
+		return list
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, entry := range list {
+		id, _ := entry["id"].(string)
+		realm, bare := "", id
+		if r, m, ok := strings.Cut(id, ":"); ok && (r == "cn" || r == "global") {
+			realm, bare = r, m
+		}
+		if allowedIn(allow, realm, bare) {
 			out = append(out, entry)
 		}
 	}
@@ -812,6 +896,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q is not allowed for this API key", bareModel))
 		return
 	}
+	// 网关级模型白名单（config models.allowed）：与密钥过滤正交，取交集。
+	// 拒绝文案不区分「不存在」与「未在白名单」，避免枚举探测。
+	if !h.modelAllowed(realm, bareModel) {
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
+			fmt.Sprintf("model %q is not available", bareModel))
+		return
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -819,13 +910,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.toolsDeclared = len(declaredTools) // issue #44 观测面：声明了 tools 却零调用 = 静默停摆
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
-	defer st.done()
+	defer func() {
+		st.done()
+		// 积分闸记账（budget.go）：只认已观测的 usage.credit；缺失（hasCredit=false）
+		// 不等于 0，绝不能把它当「免费」记入或忽略。缓存率同理只有 hasCache 才判定。
+		h.budget.add(st.credit, st.hasCredit)
+		h.budget.observeCache(st.cacheHit, st.cacheMiss, st.hasCache)
+	}()
+
+	// 积分闸：当日上限 / 突发窗口 / 连续低缓存率。到顶即 429，不再轮换打上游——
+	// 这正是「等到上限烧穿才止血」的反面：突发闸按 5 分钟窗先行拦住。
+	if ok, msg := h.budget.admit(); !ok {
+		if msg == "" {
+			msg = "gateway daily credit budget exhausted；请等待次日 00:00 CST 重置或调整 budget.daily_limit"
+		}
+		st.status = http.StatusTooManyRequests
+		st.outcome = reqlog.OutcomeHTTPError
+		writeOpenAIError(w, http.StatusTooManyRequests, "insufficient_quota", msg)
+		return
+	}
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -1444,6 +1554,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
 			}
+			// 实际调用数 = 上游结构化 delta 去重数 + 正文标记还原数（issue #44）。
+			st.toolCalls = stats.ToolCalls() + repair.Converted()
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1484,6 +1596,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 				bareModel, m, len(declaredTools))
 		}
+		// 非流式：结构化调用 + 正文标记还原数（issue #44）。注意 Aggregate 组包是
+		// []map[string]any、直解上游 JSON 才是 []any——两种形态都要认，否则非流式
+		// 永远记 0，把「零工具调用收尾」的比率直接算翻倍。
+		st.toolCalls = countResponseToolCalls(resp) + mrepair.Converted()
 		credit, total, hasCredit := usageCreditTotal(resp)
 		if usage, ok := resp["usage"].(map[string]any); ok {
 			if hit, okH := upstream.UsageCacheHitTokens(usage); okH {

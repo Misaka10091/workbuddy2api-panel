@@ -114,6 +114,19 @@ compose() {
   ( cd "$REPO_ROOT" && docker compose -f "$file" "$@" )
 }
 
+# 版本要素：与 CI 同口径。镜像里没有 .git（.dockerignore 排除 + 构建镜像没装 git），
+# 所以这里把"构建在哪个 tag 上 / 哪个提交"算好传进去，展示形态由 server 自己决定
+# （有 tag 用 tag，否则 构建时间 + 短 hash）。构建时刻交给 Dockerfile 里的 `date`：
+# 传进来会让这个 ARG 每次都变，编译层缓存永远命中不了。
+detect_build_stamp() {
+  BUILD_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+  BUILD_VERSION=$(git -C "$REPO_ROOT" describe --tags --exact-match 2>/dev/null || true)
+  export BUILD_VERSION BUILD_COMMIT
+  if [ -z "$BUILD_COMMIT" ]; then
+    warn "不在 git 仓库里：镜像里的版本串只有构建时间（没有提交 hash）"
+  fi
+}
+
 # -------------------------------------------------------------------- 命令 ---
 cmd_env() {
   printf 'REPO_ROOT      = %s\n' "$REPO_ROOT"
@@ -123,22 +136,31 @@ cmd_env() {
   printf 'FULL_REF       = %s\n' "$(full_ref)"
   printf 'CONTAINER_NAME = %s\n' "${CONTAINER_NAME:-$DEFAULT_CONTAINER_NAME}"
   printf 'PORT           = %s\n' "${PORT:-$DEFAULT_PORT}"
+  detect_build_stamp
+  printf 'BUILD_VERSION  = %s\n' "${BUILD_VERSION:-<无 tag，按 构建时间 + 短 hash>}"
+  printf 'BUILD_COMMIT   = %s\n' "${BUILD_COMMIT:-<无>}"
 }
 
 cmd_build() {
   need_docker
+  detect_build_stamp
   local ref; ref=$(full_ref)
   info "docker build → $ref"
+  local args=(
+    --build-arg "BUILD_VERSION=$BUILD_VERSION"
+    --build-arg "BUILD_COMMIT=$BUILD_COMMIT"
+  )
   if [ -n "${PLATFORMS:-}" ]; then
-    docker build --platform "$PLATFORMS" -t "$ref" "$REPO_ROOT" ${ARGS[@]+"${ARGS[@]}"}
+    docker build --platform "$PLATFORMS" -t "$ref" "${args[@]}" "$REPO_ROOT" ${ARGS[@]+"${ARGS[@]}"}
   else
-    docker build -t "$ref" "$REPO_ROOT" ${ARGS[@]+"${ARGS[@]}"}
+    docker build -t "$ref" "${args[@]}" "$REPO_ROOT" ${ARGS[@]+"${ARGS[@]}"}
   fi
   info "镜像就绪：$ref"
 }
 
 cmd_up() {
   need_docker
+  detect_build_stamp
   info "docker compose up -d --build（镜像 $(full_ref)）"
   compose up -d --build ${ARGS[@]+"${ARGS[@]}"}
 }

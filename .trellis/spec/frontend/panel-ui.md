@@ -88,6 +88,12 @@ function go(v) { … document.querySelectorAll('.view').forEach(s => s.hidden = 
 - 主题两态翻转（浅/深），首次跟随系统偏好，选择存 `wb2api.theme`，写 `document.documentElement.dataset.theme`。
 - 日志视图默认"自动滚动：开"（`logPin`）；含 `P0/P1` 之类级别词的行要能一眼区分。
 
+## 版本号（左上角）
+
+- `#navSub`（品牌副标题）与 `#navVer`（侧栏底部状态行）展示 `/panel/api/overview` 的 `version`。形态由服务端决定：tag 构建 = tag 名（`v2026.10.27.2038`），其余 = `v2026.10.27.2040-1a2b3c4`。
+- 前端**只许原样展示**，不得再拼 `v` 前缀：tag 会显示成 `vv2026.…`（`frontend_test.go` 的 `TestBrandVersionRenderedVerbatim` 把这条钉成了结构断言）。
+- 侧栏宽 208px：`.brand .sub` / `.nav .sig .row span` 用 `nowrap + ellipsis` 截断，完整串在 `title` 里悬停可见。版本串**单独占一行**，不与 Redis 模式同排——同排时末尾的 hash 会被挤掉，而 hash 正是排障要看的东西。
+
 ## 配置表单：`CFG_MAP` 是唯一映射
 
 ```js

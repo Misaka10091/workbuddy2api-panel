@@ -36,6 +36,20 @@ paths:
 
 打印闸门：`chatLogEnabled` + 输出目标 `chatLogOut`。包级 `TestMain` 会关掉它，断言 stdout 的测试用 `withChatLog` 临时打开。`SetChatLogOutput` 是唯一注入点（`cmd/server` 用它把日志同时写到面板环形缓冲）。
 
+## 归档的工具调用字段（`tools_declared` / `tool_calls`）
+
+`reqlog.Event` 只记数量，不记工具名与参数（隐私边界与正文一致）。口径：
+
+- `tools_declared` = 请求体 `tools`/`functions` 的条目数（`upstream.ToolNameAllowlist`）。
+- `tool_calls` = 实际产出的调用数：流式按 `delta.tool_calls[].index` 去重，
+  再加正文标记还原数（`MarkupRepair.Converted()`）；非流式按
+  `message.tool_calls` 长度 + 还原数。
+- **非流式两种组包形态都要认**：`upstream.Aggregate` 自己组包是 `[]map[string]any`，
+  直解上游 JSON 才是 `[]any`。只认后者会让非流式永远记 0，把「零工具调用收尾」的
+  比率算翻倍（上游 `37b3f4c` 的真实事故）。
+- `tools_declared>0 && tool_calls==0` 即一次静默停摆候选；这是 agent 场景唯一可观测的
+  上游丢调用信号，不要为了「省字段」删掉。
+
 ## 脱敏（强制）
 
 | 敏感物 | 处理 | 实现 |
