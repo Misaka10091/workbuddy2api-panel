@@ -19,7 +19,7 @@ description: 协作规范入口：分支、commit、署名、PR、tag 与"什么
 2. 分支名 `<type>/<kebab-主题>`，type 与 commit type 同一套；合并后删分支。
 3. commit 标题 `<type>(<scope>): <中文摘要>`；body 必须写**根因、取舍、测试、验证**。
 4. `author` 只能是真实人类 + GitHub noreply 邮箱；AI 用 `Co-authored-by:` 尾注（统一小写 `by`）。
-5. 只打 semver tag，且必须等于 `appVersion` 去掉 `-panel`；时间戳 tag 不要新增。
+5. tag 就是发布版本串（`v1.14.0` / `v2026.10.27.2038` 都合法）；源码里没有版本常量，别再找 `appVersion`。
 6. 禁止 `git add -A`：`*.md` 全局被忽略、`auths/` 是明文凭证、根目录有运行产物。
 
 ## 提交前检查表

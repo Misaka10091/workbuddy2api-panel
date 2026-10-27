@@ -33,9 +33,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
-
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
 func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
@@ -53,6 +50,9 @@ func stateSibling(stateFile, name string) string {
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+
+	// 版本号最先打：面板左上角展示的就是这一串，排障时先确认"跑的是哪个二进制"。
+	log.Printf("[version] %s", versionLine())
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {

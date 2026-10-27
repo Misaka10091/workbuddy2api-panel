@@ -45,6 +45,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 面板左上角的版本串随镜像走。镜像构建阶段没有 .git，构建要素只能在这里算好
+      # 传进去：tag 构建给 tag（原样展示），其余由 server 自己拼"构建时间 + 短 hash"。
+      - name: 取版本要素（tag 构建才有 tag）
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU（arm64 交叉模拟）
         uses: docker/setup-qemu-action@v3
 
@@ -83,3 +95,7 @@ jobs:
           cache-to: type=gha,mode=max
           # 关闭 provenance attestation：避免 ghcr 页面出现 unknown/unknown 架构条目
           provenance: false
+          build-args: |
+            BUILD_VERSION=${{ steps.ver.outputs.tag }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.ver.outputs.built_at }}

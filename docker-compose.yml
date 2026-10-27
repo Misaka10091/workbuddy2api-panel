@@ -5,7 +5,16 @@ services:
     #   IMAGE_NAME=my/api IMAGE_TAG=v1 docker compose up -d --build
     # 注：docker 要求仓库名全小写，写 Misaka10092/… 会被 docker 直接拒绝。
     image: ${IMAGE_NAME:-misaka10092/workbuddy2api-panel}:${IMAGE_TAG:-latest}
-    build: .
+    # 版本要素（面板左上角）：镜像里没有 .git，只能在宿主机侧算好再传进去。
+    # `./scripts/docker.sh build|up` 会自动填 tag/提交两项；构建时刻由 Dockerfile 里的
+    # `date` 取（随 ARG 传每次都会变，编译层缓存就永远命中不了）。三项都缺时版本串
+    # 只剩构建时间，不会显示假 hash。
+    build:
+      context: .
+      args:
+        BUILD_VERSION: ${BUILD_VERSION:-}
+        BUILD_COMMIT: ${BUILD_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致

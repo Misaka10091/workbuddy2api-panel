@@ -79,10 +79,16 @@ go test ./...
 
 ## 版本与发布纪律
 
-- 版本唯一来源：`cmd/server/main.go` 的 `const appVersion = "1.13.0-panel"`。没有 ldflags 注入。
-- CI 会 `grep` 这个常量、断言产物二进制里含该字符串，并在打 tag 时断言 `tag == appVersion`（先剥掉 `-panel` 后缀）。`*-ci` 结尾的 tag 跳过一致性断言（演练发布线用）。
-- 构建参数固定 `-trimpath -ldflags="-s -w"`，`CGO_ENABLED=0`，产物名 `wb2api`（Windows 带 `.exe`）；发布资产名 `wb2api-panel-v<ver>-<os>-<arch>.zip|tar.gz`。
-- 仓库里同时存在两族 tag：semver `v1.x.y` 与时间戳 `v2026.9.30.2027`。**只有 semver 族能过发布断言**，别拿时间戳 tag 打 release。tag 命名与打 tag 的完整流程见 [../collaboration/git-workflow.md](../collaboration/git-workflow.md)。
+- 版本串由二进制自己算（`cmd/server/version.go`），源码里**没有**版本常量：
+  - 打 tag 构建 → 原样展示 tag（`v2026.10.27.2038` / `v1.14.0`），由 CI `-X main.buildVersion=<tag>` 注入；
+  - 其余构建 → `v<构建时间 +08:00>-<7 位提交 hash>`（`v2026.10.27.2040-1a2b3c4`）。
+  - 取值优先级：时间 = `-X main.buildTime` → 可执行文件 mtime → `vcs.time`；hash = `-X main.buildCommit` → `vcs.revision`；全都取不到时是 `dev`（宁可显示"不知道"，不编假版本）。
+  - 时间固定按 **+08:00** 格式化（仓库时间戳 tag 的口径）。CI runner 是 UTC、开发机是 +08，不钉死时区同一份代码会差 8 小时。
+- 面板左上角 `#navSub` 与侧栏底部 `#navVer` 展示的就是这一串；前端**不得再补 `v` 前缀**（tag 会显示成 `vv2026.…`，`frontend_test.go::TestBrandVersionRenderedVerbatim` 钉住了这条）。
+- 工作区有未提交改动（`vcs.modified`）只在启动日志里标注，**不进**版本串：`v2026.10.27.2038-1a2b3c4-dirty` 会被侧栏截断，而截断最先吃掉末尾那个用来定位的 hash。
+- CI（`.github/workflows/go-binaries.yml`）注入 tag / 提交号 / 构建时刻，并断言产物含 tag（tag 构建）与本次提交号（所有构建，防编错树）。资产名：tag 构建 `wb2api-panel-v<tag>-<os>-<arch>.zip|tar.gz`，非 tag 构建 `wb2api-panel-snapshot-<sha7>-…` 且只进 CI artifact、不发布。
+- 仓库里同时存在两族 tag：semver `v1.x.y` 与时间戳 `v2026.9.30.2027`，两者都是合法发布来源（tag 本身就是版本串）。CI 不再断言"tag 等于源码版本"——那个断言随版本常量一起删掉了。
+- 构建参数固定 `-trimpath -ldflags="-s -w"`，`CGO_ENABLED=0`，产物名 `wb2api`（Windows 带 `.exe`）。
 - `go.mod` 声明 `go 1.22.5`（CI 按它装），Dockerfile 用 `golang:1.23-alpine` 构建 —— 两处版本刻意不同，不要"顺手对齐"。
 
 ## 注释风格

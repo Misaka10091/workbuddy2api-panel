@@ -163,11 +163,11 @@ git config --global user.signingkey <key-id|ssh-key-path>
 
 ## 5. Tag 与发布
 
-- **只打 semver**：`vMAJOR.MINOR.PATCH`。
-- tag 必须等于 `cmd/server/main.go` 的 `appVersion` 去掉 `-panel` 后缀（CI 会断言，不一致直接 fail）。
-- 「现状」仓库里有两族 tag：31 个 semver（最新 `v1.13.0`）与 74 个时间戳 tag（`v2026.9.30.2027`）。时间戳族是历史产物，**不要新增**——它们过不了版本断言，也会污染 docker metadata 的 semver 规则。
-- `-ci` 后缀 tag 是发布线演练（跳过版本断言），只用于验证流水线，不放正式资产。
-- 打 tag 前：`git switch main && git pull --ff-only` → 确认 `appVersion` 的改动**已经合并** → 再打 tag 并推送（`git push origin vX.Y.Z`）。
+- tag 本身就是面板版本串：打 tag 构建时 CI 把 tag 名 `-X` 进二进制，左上角原样显示（`v1.14.0` / `v2026.10.27.2038`）。源码里**没有**版本常量，所以不存在"先改版本号再打 tag"这一步。
+- 没有 tag 的构建显示 `v<构建时间 +08:00>-<提交短 hash>`（`v2026.10.27.2040-1a2b3c4`），本地 `go build` 与 Docker 构建都如此。
+- 仓库里有两族 tag：semver `v1.x.y`（最新 `v1.13.0`）与时间戳 `v2026.9.30.2027`。两族都能发——版本串直接取 tag，CI 只校验 tag 形态（`v` + 数字开头）并在产物里断言该串。
+- `-ci` 后缀的演练 tag 不再是特例（没有一致性断言可跳过），但它会生成一个带 `-ci` 的发布名，正式资产仍用干净 tag。
+- 打 tag 前：`git switch main && git pull --ff-only` → 确认要发布的提交已在 `main` → `git tag vX.Y.Z` 并推送（`git push origin vX.Y.Z`）。
 - 发布细节（`-s -w`、五平台资产名、checksums）见 [../backend/cli-and-scripts.md](../backend/cli-and-scripts.md) 与 [../backend/quality-and-testing.md](../backend/quality-and-testing.md)。
 
 ## 6. 什么不该提交（本仓库特有）
@@ -216,6 +216,6 @@ AI 参与时最后再加一行 `Co-authored-by: <Agent> <noreply@…>`。
 - 用 `Co-Authored-By` / `Co-authored-By` / `co-authored-by` 等变体制造第三种写法。
 - 给只做了 review 的代理挂 `Co-authored-by`，或虚构协作者。
 - 用真实私人邮箱提交（尤其公开仓库）。
-- 新增时间戳 tag；或在 `appVersion` 未合并时打正式 tag。
+- 指望"改了源码里的版本号就发新版本"：版本串只来自 tag（或非 tag 构建的构建时间 + 提交 hash），源码里没有版本常量可改。
 - `git add -A` 把 `auths/`、`wb2api.exe~`、`.diffdump/` 带进版本库。
 - 合并后不删分支，或长期分支不 rebase 导致 PR 全是冲突噪音。

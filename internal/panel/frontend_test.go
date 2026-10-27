@@ -604,6 +604,47 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 	}
 }
 
+// 左上角展示的版本串由服务端拼好（tag 构建 = tag 名，其余 = 构建时间 + 提交短
+// hash），前端只许原样展示。
+//
+// 为什么需要：这里原本是 `'v' + d.version`，服务端给的也恰好是不带 v 的
+// "1.13.0-panel"，所以一直没露馅。改成 tag 版本号后服务端给的是 "v2026.10.27.2038"，
+// 前端再补前缀就变成 "vv2026.…"——把这条钉住，恢复旧写法必然失败。
+func TestBrandVersionRenderedVerbatim(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	for _, bad := range []string{"'v' + d.version", `"v" + d.version`, "'v' + ver"} {
+		if strings.Contains(js, bad) {
+			t.Errorf("app.js 仍在版本串前补 v 前缀（%s）：tag 会显示成 vv2026.…", bad)
+		}
+	}
+	if !strings.Contains(js, "const ver = d.version || 'dev';") {
+		t.Error("app.js 缺版本串归一（const ver = d.version || 'dev'）")
+	}
+	if !strings.Contains(js, "$('navSub').textContent = ver;") {
+		t.Error("左上角 #navSub 未原样展示服务端版本串")
+	}
+	if !strings.Contains(js, "$('navVer').textContent = ver;") {
+		t.Error("侧栏状态行 #navVer 未与服务端版本串保持一致")
+	}
+
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+	if !strings.Contains(html, `id="navSub"`) {
+		t.Fatal("index.html 缺 #navSub（左上角版本位）")
+	}
+	// 版本串可能长到 v2026.10.27.2038-1a2b3c4：侧栏 208px，必须省略而不是换行。
+	if !regexp.MustCompile(`\.brand \.sub[^{]*\{[^}]*text-overflow:\s*ellipsis`).MatchString(html) {
+		t.Error("index.html 的 .brand .sub 缺省略号规则（长版本串会把导航挤下去）")
+	}
+}
+
 // 同到期时间按面额降序；其余未用完包与零/负余额包分别聚合。
 func TestAppJSDetailGroups(t *testing.T) {
 	node, err := exec.LookPath("node")
