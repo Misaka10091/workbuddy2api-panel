@@ -4,9 +4,9 @@
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
 // **不同的客户端指纹**：
 //
-//	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
+//	POST https://www.workbuddy.cn/v2/report        ← chatBase（CLI 上报走 billingBase）
 //	User-Agent: WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0（CN；global 走 workbuddy-ai）
-//	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
+//	X-Domain: www.workbuddy.cn, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
 // 每个事件除业务字段外必带桌面指纹（ideName/ideType=WorkBuddy、
@@ -52,7 +52,7 @@ const (
 	desktopReleaseDateGlobal = int64(1792063084107)
 )
 
-// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
+// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（缺省 www.workbuddy.cn）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // desktopTriple 返回该账号域的桌面端 (ideVersion, commit, releaseDate) 三元组。
@@ -115,7 +115,7 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 	}
 }
 
-// ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
+// ReportDesktopEvent 以桌面客户端指纹向 www.workbuddy.cn/v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
@@ -230,7 +230,7 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 	}
 }
 
-// SetAppearanceTheme 应用外观主题（实测：POST copilot.tencent.com/v2/user-asset/appearance/set，
+// SetAppearanceTheme 应用外观主题（实测：POST www.workbuddy.cn/v2/user-asset/appearance/set，
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {

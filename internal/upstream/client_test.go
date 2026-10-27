@@ -523,6 +523,29 @@ func TestDailyCheckinAlready(t *testing.T) {
 	}
 }
 
+// TestDefaultCNChatBaseIsWorkbuddyCN 缺省 CN 主域必须是官方桌面端 product.json 的
+// endpoint；billing 保持 codebuddy.cn（CLI 任务计分依赖），global 不受影响。
+func TestDefaultCNChatBaseIsWorkbuddyCN(t *testing.T) {
+	c := New()
+	cn := &auth.Auth{Domain: ""}
+	if got := c.chatBase(cn); got != "https://www.workbuddy.cn" {
+		t.Errorf("CN chat base=%q want https://www.workbuddy.cn（官方桌面端主入口）", got)
+	}
+	if got := c.billingBase(cn); got != "https://www.codebuddy.cn" {
+		t.Errorf("billing base=%q want https://www.codebuddy.cn（CLI 任务计分依赖）", got)
+	}
+	if got := c.webBase(cn); got != "https://www.workbuddy.cn" {
+		t.Errorf("web base=%q want https://www.workbuddy.cn", got)
+	}
+	// global：仍按 global base 路由，不能被 CN 新主域吞掉。
+	g := &auth.Auth{Domain: "www.workbuddy.ai"}
+	if g.IsGlobal() {
+		if got := c.chatBase(g); got != "https://www.workbuddy.ai" {
+			t.Errorf("global chat base=%q want https://www.workbuddy.ai", got)
+		}
+	}
+}
+
 func TestBasesAlwaysCN(t *testing.T) {
 	c := testClient(nil)
 	cn := &auth.Auth{Domain: ""}
