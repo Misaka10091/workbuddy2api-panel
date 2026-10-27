@@ -808,6 +808,9 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// ChatBaseCN 国内版 chat / 模型目录 / growth 域（旅行、streak）base。
+	// 缺省 https://www.workbuddy.cn（官方桌面端 product.json 的 endpoint）；
+	// config cn.chat_base 可覆盖为备选入口 copilot.tencent.com。
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
@@ -833,7 +836,15 @@ func New() *Client {
 	c := &Client{
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:    "https://copilot.tencent.com",
+		// ChatBaseCN 取官方桌面端的 endpoint（product.json），不是备选入口
+		// copilot.tencent.com —— 后者是官方 NetworkFailover 里的备选，主入口才是
+		// www.workbuddy.cn。生产实测（同一账号）：/v3/config、billing 汇总、chat
+		// 三条路径两个域返回一致，workbuddy.cn 对海外出口也不复位握手（见
+		// cmd/server/config.go 的 cn.chat_base 注释）。
+		ChatBaseCN: "https://www.workbuddy.cn",
+		// BillingBaseCN 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
+		// 桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三类区分（README「任务计分」），
+		// 改这里会连带改掉 CLI 类任务的指纹来源。
 		BillingBaseCN: "https://www.codebuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
@@ -1117,6 +1128,9 @@ func (c *Client) refreshOnce(a *auth.Auth) refreshResult {
 		return refreshResult{err: fmt.Errorf("no refreshToken")}
 	}
 
+	// 刷新地址与 chat 共用 chatBase：官方 CN 刷新在 chat 主域（www.workbuddy.cn）可用，
+	// cn.chat_base 覆盖时同步生效。OAuth 设备授权才走 copilot.tencent.com
+	// （internal/panel/login.go 的 upstreamBaseCN），两者不是同一个 base。
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()

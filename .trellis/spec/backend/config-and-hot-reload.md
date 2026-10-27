@@ -85,6 +85,7 @@ type Holder struct { p atomic.Pointer[Snapshot] }
 listen, auth_dir, state_file,
 upstream.timeout_seconds, upstream.header_timeout_seconds, upstream.idle_timeout_seconds,
 upstream.user_agent,
+cn.chat_base（非空时；装配期写进 up.ChatBaseCN）,
 upstash（配置了 URL 或 Token 时）,
 session_sticky.ttl, session_sticky.gc_interval,
 logging.request_archive_enabled, logging.request_retention_days, logging.request_archive_max_mb,

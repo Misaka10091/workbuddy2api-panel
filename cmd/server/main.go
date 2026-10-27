@@ -160,6 +160,8 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// cn.chat_base 覆盖（装配期字段：请求路径并发读取 ChatBaseCN，不做热改）。
+	applyCNChatBase(up, cfg)
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -381,6 +383,19 @@ func main() {
 	log.Printf("bye")
 }
 
+// applyCNChatBase 应用国内版 chat base 覆盖：空 = 保持内置默认
+// https://www.workbuddy.cn；非空 = 覆盖（备选入口 copilot.tencent.com 等）。
+// 装配期一次性写入：chatBase() 在请求路径并发读取 ChatBaseCN，不做热改，
+// 因此该键同时列进 restartRequiredFields。
+func applyCNChatBase(up *upstream.Client, cfg *Config) {
+	if up == nil || cfg == nil {
+		return
+	}
+	if cfg.CN.ChatBase != "" {
+		up.ChatBaseCN = cfg.CN.ChatBase
+	}
+}
+
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
 //
 // 为什么需要：倍率表只在 FetchModels（CN）/ FetchGlobalModelInfos（global）成功时
@@ -563,6 +578,11 @@ func restartRequiredFields(c *Config) []string {
 	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
 	out = append(out, "upstream.user_agent")
+	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（chatBase() 请求路径并发读取）。
+	// 必须**无条件**列入：本函数返回的是「整类清单」而不是本次 diff，若按新值非空
+	// 才列入，则「覆盖值 → 清空」这一非对称改动会静默失效——文件保存成功、面板显示
+	// 已生效，但运行中的 ChatBaseCN 仍是旧覆盖值（与 upstream.user_agent 同一教训）。
+	out = append(out, "cn.chat_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

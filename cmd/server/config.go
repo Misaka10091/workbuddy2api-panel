@@ -109,6 +109,15 @@ type Config struct {
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
 	} `json:"schedule"`
 
+	CN struct {
+		// ChatBase 国内版 chat / 模型目录 / growth 域上游 base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.cn（internal/upstream.New 的 ChatBaseCN，官方桌面端
+		// product.json 的 endpoint）。
+		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
+		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。

@@ -129,6 +129,20 @@ block := "<" + p + "DSML" + p + " calls>" +
 
 覆盖范围：`content`（字符串或 text 分块）、**`tool_calls[].function.arguments`**、`reasoning_content` 与 `reasoning`。漏掉 arguments 曾是真实盲区。开关是 `Client.SanitizeFingerprints`（atomic，默认 true），既可由配置也可由面板热改。
 
+## 三个 CN base 的分工（不可互换）
+
+| base | 域名 | 承载 | 指纹/判据 |
+|------|------|------|-----------|
+| `ChatBaseCN` | `https://www.workbuddy.cn` | chat（SSE）、`/v3/config` 模型目录、growth 域（旅行 / streak）、**token 刷新**（`refreshOnce` / `doRefresh` 用 `chatBase` 拼地址）、桌面端 `/v2/report` 与 user-asset | 桌面端 `product.json` 的 endpoint；`X-Domain` 取账号落盘 domain，否则 chatBase host |
+| `BillingBaseCN` | `https://www.codebuddy.cn` | 每日签到、余额查询、CLI 活跃上报、小程序上报 | CLI 指纹域，任务计分依赖，**不要跟着 chat 改** |
+| 登录 | `https://copilot.tencent.com` | 仅 OAuth device flow（扫码 / 设备码） | 只出现在 `internal/panel/login.go`、`cmd/login`；token 刷新不走这里 |
+
+`copilot.tencent.com` 是官方 `NetworkFailover` 里的 chat 备选入口：海外出口（Clash 全局 + TUN）
+对它 TLS 握手直接复位，因此缺省主入口必须是 `www.workbuddy.cn`；需要时用 `cn.chat_base`
+回填备选。`Client.chatBase()` 是 CN chat/目录/growth/token 刷新的单一出口，改主域只改
+`ChatBaseCN` 与这个键，不要在端点层各拼一份。**注意 `cn.chat_base` 同时改变 token 刷新
+入口**，这也是它必须无条件列入 `restartRequiredFields` 的原因之一。
+
 ## 端点清单（按域）
 
 | 域 | 端点（方法 + 路径） | 方法 |
