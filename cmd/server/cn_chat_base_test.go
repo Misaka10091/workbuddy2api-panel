@@ -27,24 +27,33 @@ func TestApplyCNChatBase(t *testing.T) {
 	applyCNChatBase(up, nil)
 }
 
-// TestCNChatBaseRestartRequired cn.chat_base 是装配期字段：配了才提示重启。
+// TestCNChatBaseRestartRequired cn.chat_base 是装配期字段，必须**恒定**列入清单。
+//
+// 为什么空值也要提示：restartRequiredFields 返回的是「整类清单」而非本次 diff，
+// 只有新值非空才列入时，「覆盖值 → 清空」不会提示——文件保存成功、面板显示已生效，
+// 运行中的 ChatBaseCN 却仍是旧覆盖值。这个非对称场景与 upstream.user_agent 同源。
 func TestCNChatBaseRestartRequired(t *testing.T) {
-	empty := &Config{}
-	for _, f := range restartRequiredFields(empty) {
-		if f == "cn.chat_base" {
-			t.Fatal("未配置 cn.chat_base 时不该提示重启")
-		}
-	}
-	cfg := &Config{}
-	cfg.CN.ChatBase = "https://copilot.tencent.com"
-	found := false
-	for _, f := range restartRequiredFields(cfg) {
-		if f == "cn.chat_base" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("配置 cn.chat_base 后应提示重启")
+	for _, tc := range []struct {
+		name string
+		base string
+	}{
+		{"未配置（空）", ""},
+		{"覆盖值被清空（新配置为空）", ""},
+		{"覆盖为备选入口", "https://copilot.tencent.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.CN.ChatBase = tc.base
+			found := false
+			for _, f := range restartRequiredFields(cfg) {
+				if f == "cn.chat_base" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("cn.chat_base 必须始终列入重启项（当前值 %q）", tc.base)
+			}
+		})
 	}
 }
 

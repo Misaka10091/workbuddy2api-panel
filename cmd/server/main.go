@@ -579,9 +579,10 @@ func restartRequiredFields(c *Config) []string {
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
 	out = append(out, "upstream.user_agent")
 	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（chatBase() 请求路径并发读取）。
-	if c.CN.ChatBase != "" {
-		out = append(out, "cn.chat_base")
-	}
+	// 必须**无条件**列入：本函数返回的是「整类清单」而不是本次 diff，若按新值非空
+	// 才列入，则「覆盖值 → 清空」这一非对称改动会静默失效——文件保存成功、面板显示
+	// 已生效，但运行中的 ChatBaseCN 仍是旧覆盖值（与 upstream.user_agent 同一教训）。
+	out = append(out, "cn.chat_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
