@@ -1128,6 +1128,9 @@ func (c *Client) refreshOnce(a *auth.Auth) refreshResult {
 		return refreshResult{err: fmt.Errorf("no refreshToken")}
 	}
 
+	// 刷新地址与 chat 共用 chatBase：官方 CN 刷新在 chat 主域（www.workbuddy.cn）可用，
+	// cn.chat_base 覆盖时同步生效。OAuth 设备授权才走 copilot.tencent.com
+	// （internal/panel/login.go 的 upstreamBaseCN），两者不是同一个 base。
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()

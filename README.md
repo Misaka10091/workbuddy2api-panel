@@ -740,9 +740,9 @@ http://127.0.0.1:7863/panel/
 
 上游接口均为 CodeBuddy 官方 CLI / 插件使用的**非公开 / 逆向接口**，未见公开 API 文档；路径及 Host 以代码内常量为准（见文末出处表）。三类 base：
 
-- **`www.workbuddy.cn`**：聊天补全（SSE）、模型目录、growth 域（旅行 / streak）——官方桌面端 `product.json` 的 endpoint；`copilot.tencent.com` 是它 `NetworkFailover` 里的备选入口，可用 `cn.chat_base` 回填
+- **`www.workbuddy.cn`**：聊天补全（SSE）、模型目录、growth 域（旅行 / streak）、**token 刷新**（`refreshOnce` 与 chat 共用 `chatBase`，因此 `cn.chat_base` 会同时改变刷新入口）——官方桌面端 `product.json` 的 endpoint；`copilot.tencent.com` 是它 `NetworkFailover` 里的备选入口，可用 `cn.chat_base` 回填
 - **`www.codebuddy.cn`**：每日签到、余额查询、活跃上报、小程序上报（CLI 指纹域，任务计分依赖）
-- **`copilot.tencent.com`**：OAuth 与 token 刷新（官方 CLI 口径，`internal/panel/login.go`、`cmd/login` 单独维护）
+- **`copilot.tencent.com`**：OAuth 设备授权（扫码/设备码登录），`internal/panel/login.go`、`cmd/login` 单独维护；token 刷新**不**走这里
 
 | 相对路径（绝对路径见出处表） | 方法 | 用途 |
 |---|---|---|

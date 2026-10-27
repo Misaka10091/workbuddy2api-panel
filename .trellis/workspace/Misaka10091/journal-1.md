@@ -24,4 +24,5 @@
 缺省三域、global 不受影响、`cn.chat_base` 覆盖/解析/重启提示。
 
 **备注**：本地原本没有 `cn` 配置节，本次按上游语义补齐；属装配期字段，
-已列入 `restartRequiredFields`（非空时提示重启）。
+**无条件**列入 `restartRequiredFields`（返回整类清单而非 diff，否则「覆盖值 → 清空」
+不会提示）。token 刷新与 chat 共用 `chatBase`，OAuth 设备授权才走 `copilot.tencent.com`。
