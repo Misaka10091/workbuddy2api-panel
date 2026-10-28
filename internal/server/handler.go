@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -1512,27 +1513,38 @@ rotate:
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 6020/6021 渠道级排队/队列满：上游容量信号，与账号健康无关。按限流处置
-			// 会逐号软冷却、与全冷却兜底互相喂成整池停摆，且换号把无效请求放大
-			// MaxRotate 倍。fail-fast 503 透传原文 + Retry-After（上游未给重置口径时
-			// 按 5s 兜底提示），客户端按 SDK 退避重试即可。
+			// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+			// **不罚号**（保留 2026-10-15 事故的核心修正——上游容量信号与账号健康无关，
+			// 按 ErrSoftRate 罚号会逐号软冷却、与全冷却兜底互相喂成整池停摆），但恢复
+			// **请求内轮转**，终态映射见末端 ErrUpstreamBusy 分支（429 + Retry-After）。
+			//
+			// 为什么轮转回来了（对本地「容量信号 fail-fast」铁律的有意反转）：
+			//   - 排队可用性是**间歇的**——2026-10-28 生产实案（多号池，kimi-k3.1-pro）
+			//     同一分钟内既有 6021 也有成功（16:38 两号连续 6021 后 33 秒内同模型
+			//     即恢复），一次性 fail-fast 把几秒的抖动直接判给客户端。
+			//   - 旧写法回 503 是致命的：WorkBuddy CLI 对 503 直接中断任务（同实案：
+			//     任务在两次 503 后死亡），对 429 则按 Retry-After 自动睡后重发（官方
+			//     排队语义）。上游对这两个形态本身回 429，网关不该改写成 503。
+			//   - 队列按 client_user_type 全局共享（实测 position 2502→2648，9s 涨 146），
+			//     换号通常只是多撞一次墙、无法绕过排队本身——轮转的价值不在「绕过」，
+			//     而在间歇空窗不再逐请求致命；代价是 MaxRotate 次上游调用，客户端按
+			//     Retry-After 重试的节奏下有界。
+			//   - 旧铁律的成因是「把排队当账号故障罚号」，不是「换号」本身；本轮保留
+			//     零惩罚（见 applyErrorPolicy 该分支），成因已切开。
 			if kind == upstream.ErrUpstreamBusy {
+				// applyErrorPolicy 仍是「罚不罚」的唯一决策点，且该 kind 在这里是
+				// 零动作分支（不冷却/不熔断/不 NoteError/不喂连败）——调它是为了将来
+				// 改动集中在一处，不是因为它现在会罚号。
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				msg := string(respBody)
-				if strings.TrimSpace(msg) == "" {
-					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				// 信封必须重建：uerr.Msg 在 upstream 侧被截断 200 字符，而末端要透传
+				// **上游原文全量**；RetryAfter 必须一起搬——body 口径（data.retry_after）
+				// 只挂在这次响应上，丢了末端就只剩 5s 兜底。
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（排队满载换号退避）
 				}
-				retryAfter := "5"
-				if uerr != nil && uerr.RetryAfter > 0 && int64(uerr.RetryAfter.Seconds()) > 0 {
-					retryAfter = fmt.Sprintf("%d", int64(uerr.RetryAfter.Seconds()))
-				}
-				w.Header().Set("Retry-After", retryAfter)
-				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
-					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
-				st.status = http.StatusServiceUnavailable
-				st.outcome = reqlog.OutcomeHTTPError
-				return
+				continue
 			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
@@ -1758,6 +1770,10 @@ rotate:
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false
+	// retryAfterSec 非 0 时在下方统一写 Retry-After 头。声明必须上移到 switch
+	// **之前**：ErrUpstreamBusy 分支（排队 → 429）要在这里填「等多久」，与下方
+	// modelBlock 的 14003 分支共用一个出口，避免两处各写一次头。
+	retryAfterSec := 0
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
@@ -1781,6 +1797,34 @@ rotate:
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
 			code = "model_unavailable"
 			status = http.StatusBadRequest
+		case upstream.ErrUpstreamBusy:
+			// 6020/6021 渠道级排队/队列满：轮转已耗尽（本请求每个号都撞同一堵墙，
+			// 或池里只有一个号）。回 429 + Retry-After，**不是 503**：
+			//   - 上游对这两个形态本身回的就是 429（6020 还带 data.retry_after），
+			//     透传原状态让下游按 OpenAI 限流语义重试；
+			//   - WorkBuddy CLI 对 429 按 Retry-After 自动睡后重发（官方排队语义），
+			//     对 503 直接中断任务（2026-10-28 实案：两次 503 后任务死亡）。
+			// 与 6004/6000 的分界（同为 429，处置相反）：那边是**模型级用量配额**
+			//（重置前重试必然失败 → 不发 Retry-After，见下方 modelBlockAllQuota 注释），
+			// 这边是**渠道排队**（等就有效 → 必须发 Retry-After）。
+			status = http.StatusTooManyRequests
+			code = "upstream_busy"
+			msg = "upstream queue is full; retry after a short wait"
+			// 等待口径优先级：body data.retry_after（parseQueueRetryAfter，已被
+			// retryAfterSanity 截断）→ 本地兜底 5s → maxRetryAfterSec 封顶。
+			// 首帧否决路径（vetoedStreamFrame 的 error 帧）没有 body 口径——
+			// FrameKind 只从 error.message 走 Classify，RetryAfter 恒 0 → 落 5s 兜底。
+			if ue.RetryAfter > 0 {
+				if secs := int(math.Ceil(ue.RetryAfter.Seconds())); secs > 0 {
+					retryAfterSec = secs
+					if retryAfterSec > maxRetryAfterSec {
+						retryAfterSec = maxRetryAfterSec
+					}
+				}
+			}
+			if retryAfterSec == 0 {
+				retryAfterSec = 5 // 上游未给口径时的本地兜底（沿用旧 fail-fast 分支的 5s）
+			}
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
@@ -1800,8 +1844,14 @@ rotate:
 	//
 	// 此前一律回 400 model_unavailable：客户端据此判定「模型被杀、重试无意义」，
 	// 高峰期表现为「模型用不了」，而官方客户端同一时刻还在排队等结果。
-	retryAfterSec := 0
 	if modelBlock.Blocked {
+		// 这一段里只有 14003（瞬时繁忙）该发 Retry-After；6004/6000 配额与
+		// 11102/11158 确定性拒绝都**不发**（配额是「等到重置前都无效」、确定性拒绝是
+		// 「换模型才有用」，报个等待时长等于骗客户端白睡）。retryAfterSec 本轮已上移
+		// 到 switch 之前与 ErrUpstreamBusy（排队 → 429 + 兜底 5s）共用同一出口，所以
+		// 在进入模型级覆盖前显式归零，把「配额/确定性拒绝不发 Retry-After」钉在本段，
+		// 而不是依赖前面的分支恰好没填。
+		retryAfterSec = 0
 		switch {
 		case modelBlockAllQuota(modelBlock):
 			status = http.StatusTooManyRequests
@@ -2213,8 +2263,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 11148 工具配对断裂：请求内容级错误（上游明示「直接重试无效，请新建任务」）。
 		// 零动作，chatCompletions 已 fail-fast 400 透传原文、终止轮转。
 	case upstream.ErrUpstreamBusy:
-		// 6020/6021 渠道级排队/队列满：上游容量信号，不是账号问题。零动作，
-		// chatCompletions 已 fail-fast 503 + Retry-After 透传原文、终止轮转。
+		// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：
+		// 上游容量信号，账号余额健康、未限流、session 未死，换号也撞同一堵墙。
+		// 零动作（不冷却/不熔断/不 NoteError/不喂连败，同 ErrContentBlocked 待遇）——
+		// 一旦按 ErrSoftRate 罚号，会与全冷却兜底互相喂成整池停摆（2026-10-15 实案）。
+		// chatCompletions 已恢复请求内轮转，轮转耗尽后走末端 ErrUpstreamBusy 分支回
+		// 429 + Retry-After；「不罚号」这条原则在本轮轮转回归中保持不变。
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →

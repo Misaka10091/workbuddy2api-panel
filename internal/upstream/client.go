@@ -45,7 +45,24 @@ const (
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 	ErrModelParamInvalid             // 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、max_tokens 过小等）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
-	ErrUpstreamBusy                  // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满 → 上游容量信号：不罚号、不轮转，末端 503 透传原文
+	// ErrUpstreamBusy 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级
+	// 排队/队列满 → 上游容量信号（与账号健康无关）：**不罚号**（零动作：不冷却/
+	// 不熔断/不 NoteError/不喂连败），但**请求内轮转**，末端 429 + Retry-After
+	// 透传上游原文（见 chatCompletions 的轮转分支与末端 switch）。
+	//
+	// 「不罚号」是 2026-10-15 事故的核心修正，本轮一字不改：那次整池停摆的成因是
+	// 把排队当账号故障去罚号（18 次全落 soft_rate），逐号软冷却与全冷却兜底互相喂。
+	//
+	// 为什么反转了本仓「容量信号 fail-fast」铁律（有意为之，别照着旧 spec 改回去）：
+	//   - 2026-10-28 生产实案：WorkBuddy CLI 对 503 直接中断任务，两次 503 任务即死；
+	//     而上游对 6020/6021 本身回的就是 429（6020 还带 data.retry_after=40）。网关
+	//     改写成 503 等于把「稍后再试」翻译成「服务不可用」。
+	//   - 排队可用性是**间歇的**：同实案同一分钟内既有 6021 也有成功（两号连续 6021
+	//     后 33 秒内同模型恢复），一次性 fail-fast 把几秒的抖动直接判给客户端。
+	//   - 旧铁律的真正成因是「罚号」而不是「换号」：本轮保留零惩罚，成因已被切开。
+	//   - 代价有界：队列按 client_user_type 全局共享，换号绕不过排队本身，轮转的价值
+	//     只在「间歇空窗不再逐请求致命」，最多 MaxRotate 次上游调用。
+	ErrUpstreamBusy
 	ErrToolMismatch                  // 11148「tool calls and tool results do not match」→ 请求内容级配对断裂：不罚号、不轮转，末端 400 透传原文
 )
 
@@ -476,6 +493,33 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 		return n, true
 	}
 	return 0, false
+}
+
+// parseQueueRetryAfter 从 6020/6021 排队响应的 body 抽上游明示的重试等待
+// （data.retry_after，整数秒）。
+//
+// 上游把排队口径放在 body 而不是 Retry-After 头（2026-10-28 真机：429 + code 6020，
+// data 含 queue_position/queue_size/retry_after/estimated_wait，头侧没有任何等待
+// 信息），ParseRetryAfter（只认头）在这里拿不到——所以头解析失败后再兜这一层。
+//
+// 只认结构化 data 字段：msg 是 i18n 键（queue.waiting.title）无数值可解析，
+// requestId 等恰好含数字的字段不能误伤。超过 retryAfterSanity 按异常值封顶
+// （estimated_wait 是另一个字段、量级不像秒级等待口径，显式只认 retry_after；
+// 封顶只防上游口径漂移时把天文数字带回）。解析不到返回 false，调用方回落本地兜底。
+func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
+	var env struct {
+		Data struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Data.RetryAfter <= 0 {
+		return 0, false
+	}
+	d := time.Duration(env.Data.RetryAfter) * time.Second
+	if d > retryAfterSanity {
+		d = retryAfterSanity
+	}
+	return d, true
 }
 
 // isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
@@ -1362,6 +1406,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
+			} else if kind == ErrUpstreamBusy {
+				// 6020 排队信封的等待口径在 body（data.retry_after），不在头
+				//（见 parseQueueRetryAfter 注释）：头解析拿不到时从 body 抽，
+				// 供 handler 末端 Retry-After 上报使用。头若给了口径以头为准。
+				if d, ok := parseQueueRetryAfter(raw); ok {
+					ue.RetryAfter = d
+				}
 			}
 			return nil, resp.StatusCode, raw, ue
 		}

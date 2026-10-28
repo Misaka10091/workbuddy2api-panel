@@ -76,8 +76,8 @@ IsModelBlocked(11102/11158, 仅 400/404)
 | 401 + 12153（**聊天路径**，业务信封） | `ErrSessionDead` | 是 | **立即 `Disable`**（`"12153 session dead"`）：业务层明确判死 | 按剩余可用决定 |
 | 网关 401（HTML 页）+ refresh 判死 | `ErrSessionDead` + `IsGatewayUnauthorized` | 是 | `NoteSessionDead` 连续 3 次才禁用（误判防护；网关拦截会成串出现，单次求证失败不等于号死） | 按剩余可用决定 |
 | 401 + 12153（**保活任务**） | `ErrSessionDead` | — | `NoteSessionDead` 连续 3 次才禁用，刷新成功则清零（P0-1：13 个 disabled 号全是立即杀号的误判） | — |
-| 11102 / 11158 | `ErrModelBlocked` | 是 | 模型级封禁（6h 起，×2，封顶 24h） | 400 `model_unavailable` |
-| 6020 / 6021 渠道排队/队列满 | `ErrUpstreamBusy` | **否：立即返回** | **否**（`applyErrorPolicy` 该分支零动作） | 503 `upstream_busy` + `Retry-After`（上游未给时 5s） |
+| 11102 / 11158 | `ErrModelBlocked` | 是 | 模型级负缓存（2026-10-28 收窄：2m 起、×2、封顶 10m；旧的 6h/24h 把一次误判放大成整天锁死） | 400 `model_unavailable` |
+| 6020 / 6021 渠道排队/队列满 | `ErrUpstreamBusy` | **是**：请求内换号重试（`rotateBackoff` 失败才 `break`） | **否**（`applyErrorPolicy` 该分支零动作：不冷却、不熔断、不喂连败） | 轮转耗尽后 **429** `upstream_busy` + `Retry-After`（body 的 `data.retry_after` 优先，缺省 5s，封顶 600s）；上游原文透传 `message` |
 | 11115 / 11135 / 11101 / 11133 / 11148 | 请求级 | **否** | **否** | 400，透传上游原文 |
 | 内容策略拦截 | `ErrContentBlocked` | 见下节 | **否** | 400 `content_blocked` |
 | WAF 403 | `ErrWafBlock` | 未激活 IP 闸→继续换号；**激活则终止轮转** | **是**：账号级软冷却（基数 `wafCooldownBase` 抖动后 ≈45–75s，`softStreak` 指数升级，封顶 `soft_rate_max`）；`Retry-After` 头优先；**不 `Disable`** | IP 闸激活时 503 `waf_ip_blocked` |
@@ -91,14 +91,19 @@ IsModelBlocked(11102/11158, 仅 400/404)
 ## 四条不动作/边界铁律
 
 1. **请求级错误不换号**：参数非法、图片无效、提示词过长、内容拦截都属于"这个请求本身的问题"，再换十个号也一样。换号只会放大上游风控信号。
-2. **上游容量信号 fail-fast**：6020/6021 是渠道排队/队列满，与账号健康无关。换号会把同一个无效请求放大 `MaxRotate` 倍，还会与全冷却兜底互相喂成整池停摆（历史事故）。因此立即 503 + `Retry-After`，交客户端按 SDK 退避重试。
+2. **上游容量信号：换号但不罚号**：6020/6021 是渠道排队/队列满，与账号健康无关，所以**零惩罚**这一条不能动——2026-10-15 的整池停摆正是「把排队当账号故障去罚号」造成的，不是换号本身。在零惩罚的前提下，请求内换号是收益而不是风险：队列按 `client_user_type` 全局共享，换号绕不过排队，但排队可用性是**间歇**的（2026-10-28 实案：两号连续 6021 后 33 秒内同模型恢复），fail-fast 把几秒抖动直接交给客户端；而 WorkBuddy CLI 对 503 的处理是**中断任务**，两次 503 任务即死。因此：换号重试（`MaxRotate` 有界，客户端按 `Retry-After` 重试的节奏下代价有界），末端回 **429 + `Retry-After`**（上游对 6020/6021 本身回的就是 429，改写成 503 等于把「稍后再试」翻译成「服务不可用」）。
 3. **基础设施故障要分级**：**超时/停滞**意味着"换到别的号撞的是同一个慢上游"，所以不换号、不罚号；**普通传输错误**（连不上、连接被重置）则是单号视角的失败，换号但只喂连败计数，达阈才降权。
 4. **冷却中不叠加**：已在冷却期内的重复失败不推进 streak、不延长 `until`。历史上"越重试越冷、整池被推到 2h 封顶"就是这条没守住。
 
 ## 提示词与内容拦截的特殊路径
 
-- 模式为 `passthrough`/`append` 且尚未降级时，遇到 `ErrContentBlocked`：`degrade.Trigger()` → 用 `prompt.Degraded` 重写一次 → `delete(tried, uid)`（单号池也要拿到重试名额）→ `continue`。**只重试一次**。
-- 第二次仍被拦：原样透传上游 body，不换号、不罚号。
+- 模式为 `passthrough`/`append` 且尚未降级时，遇到 `ErrContentBlocked` 走**三级抢救**，从「改动最小」到「改动最大」各用一次（`splitApplied` / `movedApplied` / `degradedApplied` 三个标志限死）：
+  1. `prompt.SplitSystemMessages` —— 按句界把**最长的那条** system 拆成多条，**仍在 system 里**，文本一字不改（真机实测：原段 400 / 拆开后 200）。短 system 拆开反而废掉指令，所以只拆最长一条。
+  2. `prompt.MoveSystemToUser` —— 拆不动（单句 system）时把 system 原文搬进首条 user，一个字符都不丢。
+  3. `prompt.Rewrite(body, prompt.Degraded)` —— 都不行才用中性提示词整体替换。
+  每层成功后 `degrade.Trigger()` → `delete(tried, uid)`（单号池也要拿到重试名额）→ `continue`，日志串分别是 `… -> split system into sentences, retry` / `… -> moved system text into first user message, retry` / `… -> degraded prompt retry`。
+- **抢救不占轮转预算**：抢救是对同一个请求换承载形态，不是换号。若让三层各消耗一次 `MaxRotate`，被审核的请求会从 `400 content_blocked` 退化成 `503 no_healthy_account`（抢救助手把换号名额吃完）。因此抢救的 `continue` 要把轮转下标回退（三次由 applied 标志限死，不会无限循环）。
+- 三层都被拦：原样透传上游 body，回 `content_blocked`，不换号、不罚号。
 - `ErrPromptTooLong` 一类必须透传上游原文，禁止用固定文案覆盖。
 
 ## 池内错误与"重试已经没用"的判定
@@ -139,7 +144,8 @@ func VerifySessionByRefresh(...) VerifyVerdict
 - 把 `Inconclusive` 当成 Dead 处理（会误禁号）。
 - 在网关 401 求证里用裸 `break` 终止轮转：它只跳出 `switch`，会落回循环外收尾，把同一次失败按第二个错误类别再罚一遍（`VerifyAlive` 因此把刚刷新成功的号 `Disable`）。轮转循环终止一律用 `break rotate`。
 - 把「刷新失败」等同于「账号不可用」：`SessionDeadButUsable`（AT 未过期）时该号 chat 仍然通。
-- 把 6020/6021 当账号故障去换号（放大无效请求，且会喂成整池停摆）。
+- 把 6020/6021 当**账号故障**去罚号（冷却/熔断/连败计数）——那才是 2026-10-15 整池停摆的成因；换号本身不罚号是允许且推荐的。
+- 把 6020/6021 回成 503：上游对这两个码本身回 429，改写成「服务不可用」会让把 503 当致命错误的客户端（WorkBuddy CLI）直接中断任务。
 - 把 6004 的**无重置文案**形态写成账号级冷却：那是模型级信号，冷整号会连带切断同号的其他模型（旧行为，已改）。
 - 用 `soft_rate_max` 截短模型级的上游重置时刻：那会在上游恢复前再送一次必然失败的请求。
 - 给 6004 配额响应加 `Retry-After`（客户端会整段睡死）。

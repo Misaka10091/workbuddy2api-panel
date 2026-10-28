@@ -100,7 +100,7 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 | 14003 模型忙 | `CooldownModelBusy` / `CooldownModelBusyWithWait` | 10s 起 ×2，封顶 1m；**带 `Retry-After` 时采信该值并钳到 1m** | 硬编码 |
 | 402 余额耗尽 | `CooldownUntilTomorrow4AM` | 到本地 04:00（04:00 前则今天 04:00） | 硬编码 |
 | 404 | handler 调 `Cooldown(CoolSoft, 60s)` | 固定 60s，不推进 streak | 硬编码（有意不复用 `soft_rate`） |
-| 11102/11158 | `BlockModelBackoff` | 6h 起 ×2，封顶 24h | 硬编码 |
+| 11102/11158 | `BlockModelBackoff` | 2m 起 ×2，封顶 10m（2026-10-28 从 6h/24h 收窄：11102 不总是「这号真没这模型」——路径级差异、上游瞬时抖动、分类误判都会给同一个码，旧的基数把一次误判放大成整天锁死，多号轮一圈就是整池该模型 503） | 硬编码 |
 | 5xx 熔断 | `recordBreakerFailureLocked` | `breaker_cooldown << retryCount`，封顶 `breaker_cooldown_max` | `pool.breaker_threshold` / `breaker_cooldown` / `breaker_cooldown_max` |
 | 未分类失败 | `NoteFailures` | 固定 `degrade_cooldown`，封顶 `degrade_cooldown_max` | `pool.degrade_threshold` / `degrade_cooldown` / `degrade_cooldown_max` |
 | 登录态失效（**保活 / 网关 401 求证判死**） | `NoteSessionDead` | 连续 3 次 → disable；刷新成功清零。**业务信封 12153 的聊天路径仍直接 `Disable`**（业务层明确判死） | 硬编码阈值 |
@@ -120,7 +120,7 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
   - 计数器（`err_total` / `success_count` 等）**不要** `omitempty`：零值缺失会让人误以为"没记录"。
   - 缺失字段按零值解码，即向后兼容；`err_count` 是历史键，读时迁移为 `max(err_total, err_count)`。
   - 恢复时做净化：`creditsExpiring`/`earliestRemaining` 钳进 `[0, credits]`，过期项丢弃；负 `CostPer1k`、零 `LastSeen` 丢弃。
-- **运行期字段不落盘**：`lastUsed`、`usedSeq`、`inFlight`、`fails`、`exploreLast`、`costExploreEvents`、`persistFails`、`pickSeq`、`modelCooldown.Hits`（"从 6h 基数重新学习"）。
+- **运行期字段不落盘**：`lastUsed`、`usedSeq`、`inFlight`、`fails`、`exploreLast`、`costExploreEvents`、`persistFails`、`pickSeq`、`modelCooldown.Hits`（"从 2m 基数重新学习"）。恢复时另有一条钳制：`reason` 前缀为 11102/11158 且 `Until` 超过 `now+modelBlockMaxTTL` 的条目钳到上限（不碰 6004 墙钟），否则「TTL 收窄」要等存量条目自然到期才生效。
 - 落盘失败不冒泡：`notePersistFail` 首次记日志，之后每 12 次记一次；恢复时记一行并清零计数器。
 - Redis 镜像：`StoreSnapshotter{SaveState([]byte); LoadState() ([]byte,bool)}` 这个**窄接口**是池子唯一依赖。`saveLocked` 尾部异步提交，Redis 错误只记 debug、永不返回。key 为 `wb2api:state` / `wb2api:bind:<key>`，bind TTL 7 天。
 - 启动恢复顺序：`RestoreFromSnapshot` 必须**先于** `SyncToDir`。快照 `saved_at` 为零/不可解析或没有快照 → 本地文件优先；本地文件不可读，或快照不比本地旧 → 采用快照并置 `dirty` 以便落盘。

@@ -22,7 +22,7 @@ paths:
 | 5 | 目录补 `max_tokens` | `injectCatalogMaxTokens` | 仅在 body 没有时补 |
 | 6 | 补 `stream_options.include_usage` | 内联 | 只在缺失时加 |
 | 7 | `tool_choice` 归一 | `normalizeToolChoice` | `none` 连 `tools`/`functions` 一起删 |
-| 8 | 工具参数里的 `\_` → `_` | `normalizeToolPatterns` | 与脱敏开关**无关**：这是"让请求通过" |
+| 8 | 工具 schema 归一 | `normalizeToolPatterns`（内部递归 `normalizeSchemaTree`） | 与脱敏开关**无关**：这是"让请求通过"。两件事：`\_` → `_`；`type` 缺失但 `enum` 非空时按 `inferEnumType` 无损补类型（Kimi 系只写 enum 不写 type 会 400 `11133`，而 DSH 等客户端的整套工具定义里就有这种写法）。推断不出唯一类型（混合标量 / 含 `null`）**保持原样**，不猜；`enum` 取值一字不改；`response_format` 不走这条（入口只有 `obj["tools"]`） |
 | 9 | `developer` → `system` | `normalizeRoles` | 只改这一个值；其它角色不合并/不重排/不删除 |
 | 10 | `image_url` 字符串 → 对象 | `normalizeImageURL` | 空串/非法 url 不补默认值，让上游报真实错 |
 | 11 | `stop` 字符串 → 数组 | `normalizeStop` | 上游只收数组 |
@@ -109,11 +109,11 @@ block := "<" + p + "DSML" + p + " calls>" +
 
 `headers.go` 的职责是让请求在形态上等于官方客户端。要点：
 
-- 通用必需：`X-CodeBuddy-Request: 1`（官方风控闸门头，**所有** API 请求必带）、`Accept: application/json`（不是 `*/*`）、`X-Requested-With`、按 realm 决定的 `Origin`/`Referer`、`X-Machine-ID`/`X-Session-ID`（由 uid 恒定派生，跨重启不变）。
+- 通用最小集（`CommonHeaders`）：`Accept: application/json`（不是 `*/*`）、`X-Requested-With`、`User-Agent`。**不注入** `Origin` / `Referer` / `Accept-Language` / `X-Machine-ID` / `X-Session-ID` / `X-CodeBuddy-Request`（2026-10-28 按 5.9.3 真机黄金头集收敛，上游 47f1ed6：桌面端 RPC 层是 node fetch，没有浏览器同源语义；设备标识只走 `/v2/report` 的 body；`X-CodeBuddy-Request` 由 `ChatHeaders` 单独注入，只 chat 带——真机 7/7 条 chat 带、30+ 条业务路径一条没有）。`Origin`/`Referer` 仍由需要浏览器语义的 web 层路径（`profile.go` / `tasks.go` / `global_register.go` / `desktop.go` 的 web 上报）自己设置。
 - UA 三段式：`WorkBuddy/<ver> <brand>/<ver> CLI/<cli>`；第一段恒为 camel `WorkBuddy`，只有第二段随 realm 变（CN `WorkBuddy`、global `workbuddy-ai`）。billing/checkin 走另一套硬编码 `axios/1.16.1`。`X-IDE-Version` **必须**等于 UA 里的版本，不一致本身就是可判别指纹。
 - 归属头：`X-Agent-Purpose: conversation` + `X-IDE-Name/Type/Product`；`client_name=="SaaS"` 时只发 `X-Product: SaaS`，不发 `X-IDE-*`。
 - 会话三件套是**通道校验**的一部分：`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 缺任一头即上游 400 `code=11-128`。另外 `X-Trace-ID` 与 request id **互不回落**（恒等会成为可判别痕迹），SpanId/ParentSpanId 必须独立随机。
-- 企业号才注入身份头（`X-Auth-Method`、`X-Userinfo=base64(JSON{...})`）；个人号**零注入**——补空值反而是伪造指纹。
+- 身份头族按维度条件注入（`injectIdentityHeaders`）：`id_source` 声明非空 → `X-Id-Source`；`enterprise == "" && idSource == ""`（纯个人号）→ 三头全不发；`X-Auth-Method` 只在企业态 + `token_source` 非空时发；`X-Userinfo=base64(JSON{uin, owner_uin?, id_source?, token_source?})` 条件拼接、缺维度不写空串。`token_source` **只在企业态**进 `X-Userinfo`——个人号的 `token_source` 是 token 来路（实测 CN 设备流恒 `enterprise_switch`）不是身份，据此注入等于伪造指纹。
 - `X-Device-Token` 优先级：凭证里 > 配置 > 文件（文件读取有 5min 缓存、>1KB 拒绝）。chat 与 billing 都要带。
 - **安全红线：chat 请求绝不携带 `X-Refresh-Token`**（只在 `RefreshHeaders` 里用）。
 
@@ -126,6 +126,8 @@ block := "<" + p + "DSML" + p + " calls>" +
 3. 循环剥掉尾部裸 `cc_xxx=…;`。
 4. 残留裸键名改写成 `x-anthropic-billing-hdr`（与第 2 步是两套不同语义，**不可合并成一个正则**）。
 5. 单词级替换但保留语义；其中 `"11128"` → `"11-128"` 是反探测：请求体里出现裸 `11128` 会被整单拦截。
+6. **DSH system prompt 的 `@` 路径说明段整段改写**（2026-10-28，上游 `db31fc2`）：预检 `"Tokens prefixed with @"`；正则 `(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?path (?:containing|that contains) spaces\.`；改写串用 **`project root`** 版（`workspace root` 与另一路证据冲突，`project root` 两边都安全）。这是本仓唯一「段内不含品牌词、身份规则不命中」的 DSH 指纹——上游按**连续原文**当渠道特征拦，只发首句 200、前两句连排必 400 `11-128`。所以该规则属**全局改写层**（`brand=false` 也改），放在品牌块之后、hdr 剥离之前；段外 `@`（邮箱 / npm 包名 / Windows 路径）靠「字面量预检 + 整句锚点」零误伤，规则幂等。
+7. **身份句式整句中性化**（同日，上游 `4f79fc8`）：只换品牌词不够——`You are … powered by …` 的**句子骨架本身**也是特征。正则 `(?i)You are\s+(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?(?:agent|assistant|model|AI|LLM)?[\s,]*(?:powered by|built on|built by|created by|developed by|made by|trained by)[^\n]*?\.(\s|$)` → `You are a helpful AI assistant.${1}`（`${1}` 回填句尾空白，是 RE2 无 `(?=)` 的绕法）。**修饰词窗口上界 3 是防误伤的关键**：`You are free to use tools built by …` 这类分词修饰宾语的句子必须不动。受 `features.sanitize_brand_scope` 约束，预检走「动词字面量快路 → 正则复核」（只按 `powered by` 判真会把讲解产品的普通消息也拖进清洗）。
 
 覆盖范围：`content`（字符串或 text 分块）、**`tool_calls[].function.arguments`**、`reasoning_content` 与 `reasoning`。漏掉 arguments 曾是真实盲区。开关是 `Client.SanitizeFingerprints`（atomic，默认 true），既可由配置也可由面板热改。
 
@@ -138,16 +140,22 @@ block := "<" + p + "DSML" + p + " calls>" +
 | 规则 | 实现 | 为什么 |
 |---|---|---|
 | `/v3/config` UA | `v3ProbeUA` / `v3ProbeUALite` | CN 三段 `WorkBuddy/<v> WorkBuddy/<v> CLI/<c>`，global 两段 `WorkBuddy/<v> CLI/<c>`；旧 `CodeBuddyIDE/…` 在 WorkBuddy 分发包里不存在，是最显眼的非官方指纹 |
-| chat 头剥离 | `ChatHeaders` | 不发 `Origin`/`Referer`/`Accept-Language`/`X-Machine-ID`/`X-Session-ID`；这些是 REST 通用层形态，桌面 chat 从不发 |
+| chat 头剥离 | `CommonHeaders` 不再注入 | 五个头（`Origin`/`Referer`/`Accept-Language`/`X-Machine-ID`/`X-Session-ID`）在 5.9.3 真机上一条都不存在，故从通用层删掉，而不是"通用层发、chat 层删"（两层做法会让 refresh/billing 继续带着 chat 不带的头） |
 | 不发明哨兵头 | `ChatHeaders` / `injectGlobalChatHeaders` | 个人号两个方向都不发 `X-No-Enterprise-Id`/`X-No-Department-Info` |
 | `Accept` | `ChatHeaders` | 只 `application/json`（官方仍收 SSE 流）；`Accept-Encoding` 刻意不设，否则关闭 net/http 透明解压 |
-| `X-Private-Data` | `ChatHeaders` | 官方 chat 恒发 `true` |
+| `X-Private-Data` | `privateDataHeaderValue`（`ChatHeaders` 调用） | 按账号形态：企业版 `true`、个人号 `false`（真机反编译是 `resolveModelOptimizationEnabled ? "false" : "true"`；判据 `EnterpriseID`，**不是** `token_source`）。2026-10-28 前写死 `true`，与 5.9.3 真机相反 |
+| `X-Agent-Runtime` / `baggage` | `ChatHeaders` | 恒 `local-agent`；baggage 六键（`buddyId=`/`buddyName=` 空值保留 `k=` 形态，两个 `codebuddy.*` 键从已注入的头读回，保证头体同值） |
+| `X-Agent-Type` | `injectClientSDKHeaders(req, agentType)` | 空 = `main`；辅助链（面板判据对话 / 夜猫子）传 `AgentTypeAuxiliary`。真机另有 compaction/subagent/team 三档，网关不臆造 |
 | `X-Product` | `injectAttribution` | 恒 `SaaS`；产品名由 `X-IDE-Name/Type/Version` 承载（同名不同值比多头更易被规则命中） |
 | 桌面任务链 | `DesktopChatWithExpert` | 一律走 `ChatHeaders`，不再手搓 20 多头（手搓是漂移根因） |
 | 桌面上报指纹 | `desktopFingerprint` | `osVersion=10.0.28000`、`cpuModel`、`cpuCores=8`、`memorySize=16`；`qimei36` **仅 CN**（国际版真机不带） |
 | `X-Domain` | `desktopHost` | 上报头发**裸主机名**，不是带 scheme 的 URL |
 | `X-Request-ID` | `session.NewMessageID` | 32 hex 消息 ID 形态，不是十进制纳秒 |
-| 会话 ID | `session.NewConversationID` | v4 UUID；**禁止** `wb2api-*` 自证前缀进任何出站字段 |
+| 会话 ID / `acp-connection-id` | `session.NewTimeOrderedID` / `buildTimeOrderedUUID` | **UUIDv7**（时间有序：前 48 bit 可解出毫秒、第 13 位恒 7）。派生分支的时间位取 sha256 伪时间（锚 2026-01-01 + 24 个月窗口）——取 `time.Now()` 会让同 (账号, 会话) 每轮换值、缓存槽全废。`prompt_cache_key` 仍是 v4（改 v7 会让存量会话缓存槽整体漂移一次）。**禁止** `wb2api-*` 自证前缀进任何出站字段 |
+| `X-Root-Request-ID` | `injectConversationHeaders` | 会话级根（handler 用 `session.RequestIDForKey("root:"+会话键)` 派生）；无会话键的调用方回落轮级 `X-Conversation-Request-ID`，头不能丢 |
+| refresh 头族 | `RefreshHeaders` | 11 键；**`Authorization` 与 `X-Refresh-Token` 双发**（与 chat 相反——chat 绝不带 `X-Refresh-Token`）；`Accept` 是宽松值 `application/json, text/plain, */*`；body 是 2 字节 `{}` |
+| `/v2/report` | `reportHeaders`（与 `desktop.ReportDesktopEvent` 共用） | 走 **chatBase**（不是 billingBase）、三段式 UA、`X-Requested-With`、`X-Request-ID`；**不带** `X-Device-Token`（只有 billing 族带） |
+| chat body 编码 | `maybeGzipChatBody`（`Client.GzipMinChatBody`，默认 1024） | ≥阈值走 gzip（BestSpeed），压缩失败静默发明文；`Content-Encoding` 只在真压缩后设置。阈值是 Client 字段，便于测试等价关闭 |
 
 自证前缀曾散落 15 处（面板任务、排程活跃、旅行领养、夜猫子、校园活动、桌面会话）。新增出站 ID 一律用 `internal/session` 的两个生成器，不要再手拼 `fmt.Sprintf("wb2api-…")`。
 
@@ -156,7 +164,7 @@ block := "<" + p + "DSML" + p + " calls>" +
 | base | 域名 | 承载 | 指纹/判据 |
 |------|------|------|-----------|
 | `ChatBaseCN` | `https://www.workbuddy.cn` | chat（SSE）、`/v3/config` 模型目录、growth 域（旅行 / streak）、**token 刷新**（`refreshOnce` / `doRefresh` 用 `chatBase` 拼地址）、桌面端 `/v2/report` 与 user-asset | 桌面端 `product.json` 的 endpoint；`X-Domain` 取账号落盘 domain，否则 chatBase host |
-| `BillingBaseCN` | `https://www.codebuddy.cn` | 每日签到、余额查询、CLI 活跃上报、小程序上报 | CLI 指纹域，任务计分依赖，**不要跟着 chat 改** |
+| `BillingBaseCN` | `https://www.workbuddy.cn` | 每日签到、余额查询、CLI 活跃上报、小程序上报 | 5.9.3 真机把 CN 侧**全部** billing / growth / activity 打到 workbuddy.cn（checkin 23 条、`get-user-resource-*` 12 条、growth 13 条、trial/pay 5 条，`codebuddy.cn` 一次都没出现）。旧值 codebuddy.cn 是 CodeBuddy CLI 时代口径；`cn.billing_base` 可退回（空 = 新默认，装配期字段，进 `restartRequiredFields`） |
 | 登录 | `https://copilot.tencent.com` | 仅 OAuth device flow（扫码 / 设备码） | 只出现在 `internal/panel/login.go`、`cmd/login`；token 刷新不走这里 |
 
 `copilot.tencent.com` 是官方 `NetworkFailover` 里的 chat 备选入口：海外出口（Clash 全局 + TUN）

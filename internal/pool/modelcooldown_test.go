@@ -610,6 +610,59 @@ func TestModelCooldownsPersist(t *testing.T) {
 	}
 }
 
+// TestModelCooldownsPersistClampsStaleBackoff 存量 state.json 里升级前写入的 11102
+// 负缓存 Until 可能是 now+6h（旧基数 6h / 旧封顶 24h）。恢复路径必须把它钳到
+// now+modelBlockMaxTTL，否则「TTL 收窄」这个修正要等自然到期（最长 6h）才生效——
+// 而收窄的目的正是让误判快速自愈。
+//
+// 钳制只作用于 11102/11158（reason 前缀判定）：6004 的 Until 是上游权威重置墙钟，
+// 钳它等于提前放行一个仍然超额度的号，必须原样保留。
+func TestModelCooldownsPersistClampsStaleBackoff(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	now := time.Now()
+	// 直接写盘：模拟旧版本落下的两个条目（11102 超长退避 + 6004 重置墙钟）。
+	stale := `{"accounts":{"u1":{"model_cooldowns":{
+		"glm-5.3":{"until":"` + now.Add(6*time.Hour).UTC().Format(time.RFC3339Nano) + `","reason":"11102 service info not found"},
+		"glm-5.4":{"until":"` + now.Add(6*time.Hour).UTC().Format(time.RFC3339Nano) + `","reset_at":"` + now.Add(6*time.Hour).UTC().Format(time.RFC3339Nano) + `","reason":"6004 model rate limit"}
+	}}}}`
+	if err := os.WriteFile(fp, []byte(stale), 0o600); err != nil {
+		t.Fatalf("写存量 state.json: %v", err)
+	}
+
+	p := New(fp)
+	defer p.Close()
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.mu.RLock()
+	backoff := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	quota := p.byUID["u1"].modelCooldowns["glm-5.4"]
+	p.mu.RUnlock()
+
+	// 11102：钳到 now+max（留 2s 余量吸收执行耗时）。
+	if limit := time.Now().Add(modelBlockMaxTTL + 2*time.Second); backoff.Until.After(limit) {
+		t.Errorf("存量 11102 Until=%v 未钳制（应 <= now+%v）", backoff.Until, modelBlockMaxTTL)
+	}
+	if !backoff.Until.After(time.Now()) {
+		t.Errorf("钳制不得把 11102 条目变成已过期：Until=%v", backoff.Until)
+	}
+	if backoff.Reason != "11102 service info not found" {
+		t.Errorf("钳制只改 Until，reason 应原样保留：%q", backoff.Reason)
+	}
+	// 6004：wall clock 不碰（仍应在 5h 以上）。
+	if quota.Until.Before(time.Now().Add(5 * time.Hour)) {
+		t.Errorf("6004 Until=%v 被误钳（重置墙钟必须原样保留）", quota.Until)
+	}
+	// reason 前缀判定覆盖两支：11158 同为确定性负缓存（与 11102 同走钳制路径），
+	// 6004 不是（上游重置墙钟，不得被钳）。
+	if !modelBlockBackoffReason("11158 not allowed for user type") {
+		t.Error("11158 也必须被识别为确定性负缓存（与 11102 同族同判）")
+	}
+	if modelBlockBackoffReason("6004 model rate limit") {
+		t.Error("6004 是上游重置墙钟，不得被当作负缓存钳制")
+	}
+}
+
 // TestModelCooldownsPersistCompatOldState 旧 state.json 无 modelCooldowns 字段正常加载
 // （缺字段零值，模型冷却清零退化为账号级，向后兼容）。
 func TestModelCooldownsPersistCompatOldState(t *testing.T) {

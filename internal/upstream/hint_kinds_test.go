@@ -15,10 +15,10 @@ func TestGatewayHintNewKinds(t *testing.T) {
 		want string
 	}{
 		{
-			name: "6021 队列满 → 等一会，换号无用",
+			name: "6021 队列满 → 网关已轮转、队列共享，按 Retry-After 等",
 			kind: ErrUpstreamBusy,
 			msg:  `{"code":6021,"msg":"queue.full.title"}`,
-			want: "will not help",
+			want: "already rotated",
 		},
 		{
 			name: "11148 配对断裂 → 新建会话",

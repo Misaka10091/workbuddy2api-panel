@@ -103,6 +103,7 @@ server.read_timeout
 | `prompt.mode`、`prompt.file`（→ `PromptText`） | `cmd/server/main.go` → `server.Config{PromptMode, PromptText}` | 进 handler 结构体，请求期不重读 |
 | `global.enabled` | `up.GlobalEnabled`、`auth.SetGlobalEnabled`、`server.Config.GlobalEnabled` | 三处一次性写入（上游闸 / auth 闸 / handler 闸） |
 | `global.chat_base`、`global.billing_base` | `up.ChatBaseGlobal`、`up.BillingBaseGlobal` | 出站 base 装配后固定 |
+| `cn.billing_base` | `up.BillingBaseCN`（`main.go` 的 `applyCNBillingBase`） | 与 `cn.chat_base` 同规格：装配期一次性写入，空 = 内置默认 `https://www.workbuddy.cn`（2026-10-28 从 codebuddy.cn 切换） |
 | `upstream.client_version`、`cli_version`、`client_name` | `up.ClientVersion` / `up.CliVersion` / `up.ClientName` | 出站 UA 与归属头在装配期定型 |
 | `upstream.device_token`、`device_token_file`、`passthrough_ip` | `up.DeviceToken` / `up.DeviceTokenFile` / `up.PassthroughIP` | 同上 |
 | `budget.daily_limit`、`burst_limit`、`cache_low_rate` | `saveConfig` → `budgetHook` → `Handler.SetBudgetLimit` / `SetBudgetGuards` | **热生效**：保存即改运行中的 `dailyBudget`，不再列入 `restartRequiredFields` |

@@ -340,13 +340,31 @@ func clearRoutingModelCooldownsLocked(e *entry) {
 }
 
 // modelBlock TTL 常量（11102 负缓存退避）：
-// 首次命中 6h；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
-// 封顶 24h（最多一天再试一次）。该模型请求成功即由 BlockModelClear 清除。
+// 首次命中 2m；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
+// 封顶 10m（最多十分钟再试一次）。该模型请求成功即由 BlockModelClear 清除。
+//
+// 为什么从 6h/24h 缩到 2m/10m（2026-10-27，吸收 ithtelab/workbuddy-manager#312 的
+// 0033 与 issue #308 的复现）：11102 不总是「这号真没这模型」——它也会由路径级差异、
+// 上游瞬时抖动、分类误判触发。原参数把一次偶发误判放大成 (账号,模型) 锁死 6 小时，
+// 多号轮一圈就是整池该模型 503，而实测同一账号两分钟就能恢复。退避仍然保留：真没
+// 模型的账号反复命中会升到封顶 10 分钟，不会退化成「每请求重试」——那是另一种浪费
+// （每个请求都白打一次上游 + 日志风暴，且永远学不到任何东西）。
+//
+// 阶梯仍能走到封顶：base<<shift = 2m×16 = 32m > max 10m（见
+// TestModelBlockTTLShortEnoughToSelfHeal 的区间断言）。
 const (
-	modelBlockBaseTTL = 6 * time.Hour
+	modelBlockBaseTTL = 2 * time.Minute
 	modelBlockShift   = 4
-	modelBlockMaxTTL  = 24 * time.Hour
+	modelBlockMaxTTL  = 10 * time.Minute
 )
+
+// modelBlockBackoffReason 报告 reason 是否属于 11102/11158 的**确定性负缓存**条目
+// （Until = 指数退避 TTL），用于与 6004 的「上游重置墙钟」区分。
+// 11102 条目的 reason 恒以 "11102" 开头、11158 以 "11158" 开头
+// （见 upstream.ModelBlockReasonFor / ModelForbiddenReason）。
+func modelBlockBackoffReason(reason string) bool {
+	return strings.HasPrefix(reason, "11102") || strings.HasPrefix(reason, "11158")
+}
 
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口
 // （handler.applyErrorPolicy 调用）。复用 modelCooldowns 机制（不新建平行状态）：
@@ -407,7 +425,8 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	mc, exists := e.modelCooldowns[model]
 	// 11102「该后端无此模型」/ 11158「该账号类型无权使用」都是确定性负缓存：
 	// 权限或路由恢复后，成功请求必须能清掉，否则模型会被永久锁在本账号上。
-	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
+	// 判据与恢复路径的存量钳制共用 modelBlockBackoffReason（reason 前缀单一口径）。
+	if !exists || !modelBlockBackoffReason(mc.Reason) {
 		return
 	}
 	delete(e.modelCooldowns, model)
