@@ -10,7 +10,8 @@
 //	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
 //	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
 //
-// 接口与聚合逻辑：POST codebuddy.cn/v2/billing/meter/get-user-resource，聚合所有 package 的
+// 接口与聚合逻辑：POST {billingBaseFor(realm)}/v2/billing/meter/get-user-resource（CN 域自
+// 2026-10-28 起是 workbuddy.cn，见下方 billingBaseCN），聚合所有 package 的
 // Cycle* 字段，TotalDosage 作 size 下限。
 package main
 
@@ -26,10 +27,14 @@ import (
 	"time"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+// billingBaseCN 国内计费域。2026-10-28 起与 internal/upstream 的 BillingBaseCN 同步切到
+// www.workbuddy.cn：5.9.3 真机 billing 族（含 get-user-resource）的 host 全部是
+// workbuddy.cn，没有一条打 codebuddy.cn。两处口径必须一致——否则「查积分」与实际
+// 计费走不同域，得到互相矛盾的余额。
+const billingBaseCN = "https://www.workbuddy.cn"
 
 // billingBaseGlobal 国际版计费域。global 账号打 CN 域会得到 401：
-// www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
+// CN 域不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
 const billingBaseGlobal = "https://www.workbuddy.ai"
 
 // billingBaseFor 按账号 realm 选择计费域。

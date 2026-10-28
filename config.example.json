@@ -40,7 +40,8 @@
     "include_disabled_in_tasks": false
   },
   "cn": {
-    "chat_base": ""
+    "chat_base": "",
+    "billing_base": ""
   },
   "global": {
     "enabled": true,

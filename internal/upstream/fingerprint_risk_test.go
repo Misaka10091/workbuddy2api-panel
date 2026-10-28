@@ -20,7 +20,12 @@ func sseResponse() *http.Response {
 }
 
 // TestChatHeadersStripBrowserSemantics 桌面端 chat 不发浏览器语义头，也不发
-// X-No-* 哨兵头；Accept 只 application/json；X-Private-Data 恒发；X-Product 恒 SaaS。
+// X-No-* 哨兵头；Accept 只 application/json；X-Product 恒 SaaS。
+//
+// X-Private-Data 反转（2026-10-28，上游 47f1ed6）：旧断言「恒 true」。5.9.3 真机
+// 反编译是 `resolveModelOptimizationEnabled(...) ? "false" : "true"`——个人号默认
+// 开模型优化 → **false**，企业版（合规默认关）→ true。故这里对个人号断 false，
+// 企业号的 true 分支由 headers_parity_test.go 的 TestPrivateDataTrueBranch 钉住。
 func TestChatHeadersStripBrowserSemantics(t *testing.T) {
 	var got http.Header
 	c := testClient(func(r *http.Request) (*http.Response, error) {
@@ -45,8 +50,8 @@ func TestChatHeadersStripBrowserSemantics(t *testing.T) {
 	if v := got.Get("Accept"); v != "application/json" {
 		t.Errorf("Accept=%q want application/json", v)
 	}
-	if v := got.Get("X-Private-Data"); v != "true" {
-		t.Errorf("X-Private-Data=%q want true", v)
+	if v := got.Get("X-Private-Data"); v != "false" {
+		t.Errorf("X-Private-Data=%q want false（个人号默认开模型优化）", v)
 	}
 	if v := got.Get("X-Product"); v != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS（产品名由 X-IDE-* 承载）", v)

@@ -807,7 +807,11 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
+	// 面板判据对话属辅助链：X-Agent-Type: auxiliary（用户真实对话是 main），
+	// 让上游把网关自发的后台会话与真实会话区分开。
+	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{
+		AgentType: upstream.AgentTypeAuxiliary,
+	})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}

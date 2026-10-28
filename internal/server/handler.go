@@ -1143,6 +1143,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	// 会话级根请求 ID（X-Root-Request-ID）：真机一次会话的根锚点，与轮级聚合主键
+	// 不同值。无会话键的调用方留空 → ChatMeta 回落轮级（见 injectConversationHeaders）。
+	if sessKey != "" {
+		chatMeta.RootRequestID = session.RequestIDForKey("root:" + sessKey)
+	}
 
 	// rotate 是轮转循环的标签：循环体内**嵌套 switch**（如网关 401 的求证分支）
 	// 里的 break 只跳出 switch，用裸 break 终止轮转会静默落回循环外的收尾路径，

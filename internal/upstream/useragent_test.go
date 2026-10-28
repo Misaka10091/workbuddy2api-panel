@@ -20,9 +20,12 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
-// 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
+// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（travel/balance/checkin）
+// 仍是 billing 层的 axios 串。
+//
+// 反转点（2026-10-28，上游 ee1c80d）：`/v2/report` 已从 billing 族移到 **chatBase +
+// 桌面 UA**，故 report 子用例的期望值从 `axios/1.16.1` 变成桌面三段式。CN 下桌面 UA
+// 与 chat UA 字面相同（两段同品牌 = WorkBuddy），因此这里复用 defaultUAString。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -44,11 +47,11 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			wantUA: defaultUAString,
 		},
 		{
-			name: "billing_report",
+			name: "report_desktop_ua",
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "axios/1.16.1",
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,7 +136,7 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	// /v3/config 的探测 UA 恒取自官方 WorkBuddy 家族，不受 upstream.user_agent 覆盖
 	// （issue #51：旧串 `CodeBuddyIDE/...` 在 WorkBuddy 分发包里不存在）。
-	wantV3UA := "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	wantV3UA := "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
@@ -163,9 +166,9 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	defaultUAString      = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.165.0"
 	billingUAWorkBuddy   = "axios/1.16.1"
 	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"

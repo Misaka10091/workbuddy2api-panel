@@ -40,7 +40,7 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
-	wantUA := desktopUAFor(nil)
+	wantUA := c.desktopUAFor(nil)
 	if gotUA != wantUA {
 		t.Errorf("UA=%q want %q", gotUA, wantUA)
 	}
@@ -98,12 +98,13 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 
 // TestSetAppearanceTheme 断言主题设置端点形状（点亮 Hp_Appearance 的 API）。
 func TestSetAppearanceTheme(t *testing.T) {
+	wantUA := (&Client{}).desktopUAFor(nil)
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/user-asset/appearance/set" {
 			t.Errorf("path=%s want /v2/user-asset/appearance/set", r.URL.Path)
 		}
-		if r.Header.Get("User-Agent") != desktopUAFor(nil) {
+		if r.Header.Get("User-Agent") != wantUA {
 			t.Errorf("UA=%q want desktop UA", r.Header.Get("User-Agent"))
 		}
 		raw, _ := io.ReadAll(r.Body)

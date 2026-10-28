@@ -1,10 +1,14 @@
-// report.go growth 域「对话活跃上报」接口：POST {billingBase}/v2/report。
-// 照抄客户端 chat_request_send 事件形状（含 conversationId/mode/inputLength 等全字段，
-// 勿用最小 3 字段，防上游后续加严）。事件必须带 userId（=账号 uid），缺失则服务端
-// 200 但静默丢弃（实测见 REPORT-active-map.md §2）。
+// report.go growth 域「对话活跃上报」接口：POST {chatBase}/v2/report。
+// 照抄客户端 chat_request_send 事件形状（含 conversationId/mode/inputLength 等全字段 +
+// 桌面指纹，勿用最小 3 字段，防上游后续加严）。事件必须带 userId（=账号 uid，由
+// desktopFingerprint 提供），缺失则服务端 200 但静默丢弃（实测见 REPORT-active-map.md §2）。
 //
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务（领养前置）。
 // 风控口径：每号每天 1 次即可（activity_hours 单时点），不做多时点高频上报。
+//
+// 2026-10-28（上游 ee1c80d / 5.9.3）：通道从 billingBase 改到 **chatBase**，且不再走
+// billingJSON / BillingHeaders —— 真机 /v2/report 是桌面指纹域的 9 键头族（与 billing
+// 族的 axios 形态完全不同），故自建 reportHeaders。字段集同步增删见 chatRequestEvent。
 package upstream
 
 import (
@@ -13,17 +17,49 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // reportPath 活跃上报通道（实测）。
 const reportPath = "/v2/report"
 
-// billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
+// reportHeaders /v2/report 的专用头族（5.9.3 真机 9 键黄金集，剔除 host /
+// connection / content-length / accept-encoding / x-device-token / content-encoding
+// 六类传输头后）：accept / authorization / content-type / user-agent / x-domain /
+// x-product / x-request-id / x-requested-with / x-user-id。
+//
+// 为什么单独一份而不是复用 CommonHeaders：桌面用户代理是两段同品牌（desktopUAFor），
+// Accept 是宽松值、Content-Type 带 charset、X-Domain 取 chat 域裸主机名，且**不带**
+// X-Device-Token（只有 billing 族带）。ReportDesktopEvent 与 chat 活跃上报共用本函数，
+// 两处一旦各写一份就会再次漂移。
+func (c *Client) reportHeaders(req *http.Request, a *auth.Auth) {
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-Request-ID", session.NewMessageID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("User-Agent", c.desktopUAFor(a))
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
+	}
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	req.Header.Set("X-Domain", c.chatHost(a))
+}
+
+// billingJSON 发 billing 域（billingBase）请求并解信封。body 为 nil 时按方法补默认体：
+// POST 补 `{}`（真机 billing 族 POST 的 Content-Length 恒 2），其余方法不带体。
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
-// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 信封与错误语义同 doJSON。
+//
+// X-Request-ID 只在这里注入，**不进 BillingHeaders** —— BillingHeaders 被 travel.go /
+// tasks.go 复用于 chatBase 的 /activity/growth/*，那几条路径没有抓包证据，共用头族里
+// 塞新头会外溢成新的形态偏差。
 func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
@@ -32,12 +68,16 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 			return nil, err
 		}
 		rdr = bytes.NewReader(raw)
+	} else if method == http.MethodPost {
+		// 真机 billing 族 POST（checkin-activity-status 等）Content-Length 恒 2、body 是 {}。
+		rdr = strings.NewReader("{}")
 	}
 	req, err := http.NewRequest(method, c.billingBase(a)+path, rdr)
 	if err != nil {
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	return c.doJSON(req)
 }
 
@@ -97,12 +137,15 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	return err
 }
 
-// chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
-// userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
+// chatRequestEvent 客户端 chat_request_send 事件完整形状（5.9.3 真机 report 事件）。
+// userId / timestamp / reportDelay / presentAt 由 desktopFingerprint 提供，本结构不再
+// 重复持有（同一字段两处写值必然漂移）。
+//
+// 与 5.8.x 相比删掉的字段（上游 ee1c80d）：maxToken / maxSteps / temperature /
+// maxRetries / skillCount / totalCount / fileUri / expertId —— 真机这条事件里不再出现，
+// 多发一个客户端不发的键同样是指纹。
 type chatRequestEvent struct {
 	EventCode             string `json:"eventCode"`
-	Timestamp             int64  `json:"timestamp"`
-	ReportDelay           int    `json:"reportDelay"`
 	Mode                  string `json:"mode"`
 	ConversationID        string `json:"conversationId"`
 	RequestID             string `json:"requestId"`
@@ -113,37 +156,51 @@ type chatRequestEvent struct {
 	IsAutoExecuteTerminal bool   `json:"isAutoExecuteTerminal"`
 	IsAutoModify          bool   `json:"isAutoModify"`
 	CodebaseEnable        bool   `json:"codebaseEnable"`
-	MaxToken              int    `json:"maxToken"`
-	MaxSteps              int    `json:"maxSteps"`
-	Temperature           int    `json:"temperature"`
-	MaxRetries            int    `json:"maxRetries"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`
 	CodebaseID            string `json:"codebaseId"`
 	MentionContextCount   int    `json:"mentionContextCount"`
 	Command               string `json:"command"`
-	ExpertID              string `json:"expertId"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	SkillCount            int    `json:"skillCount"`
-	TotalCount            int    `json:"totalCount"`
-	FileURI               string `json:"fileUri"`
-	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
 	RootRequestID         string `json:"rootRequestId"`
 	ParentConversationID  string `json:"parentConversationId"`
 	AgentName             string `json:"agentName"`
 	AgentType             string `json:"agentType"`
-	UserID                string `json:"userId"`
+
+	// 5.9.3 新增维度：Max 模式标记、来源、输入尝试 ID 与 VCS 段（真机恒 unknown + 三空串）。
+	IsMaxMode      bool   `json:"isMaxMode"`
+	Source         string `json:"source"`
+	InputAttemptID string `json:"inputAttemptId"`
+	VcsType        string `json:"vcsType"`
+	VcsRepo        string `json:"vcsRepo"`
+	VcsBranchName  string `json:"vcsBranchName"`
+	VcsRevID       string `json:"vcsRevId"`
+
+	// buddyId / buddyName 恒空但保留键（真机序列化保留空值对）。
+	BuddyID   string `json:"buddyId"`
+	BuddyName string `json:"buddyName"`
+
+	// OTel 风格的点号键：与同请求的会话 ID / 轮级 ID 同值。
+	CodebuddySessionID             string `json:"codebuddy.session_id"`
+	CodebuddyConversationRequestID string `json:"codebuddy.conversation_request_id"`
 }
+
+// reportDefaultModelID / reportDefaultModelName ReportChatActivity 的缺省上报模型
+// （5.9.3 真机默认模型从 deepseek-v4-flash 换成 deepseek-v4.1-flash）。
+const (
+	reportDefaultModelID   = "deepseek-v4.1-flash"
+	reportDefaultModelName = "DeepSeek-V4.1-Flash"
+)
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
 // conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
 // requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
-	return c.ReportChatActivityModel(a, conversationID, requestID, "deepseek-v4-flash", "DeepSeek V4 Flash")
+	return c.ReportChatActivityModel(a, conversationID, requestID, reportDefaultModelID, reportDefaultModelName)
 }
 
 // ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
@@ -153,16 +210,13 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		requestID = conversationID
 	}
 	if modelID == "" {
-		modelID = "deepseek-v4-flash"
+		modelID = reportDefaultModelID
 	}
 	if modelName == "" {
 		modelName = modelID
 	}
-	now := time.Now().UnixMilli()
 	ev := chatRequestEvent{
 		EventCode:             "chat_request_send",
-		Timestamp:             now,
-		ReportDelay:           0,
 		Mode:                  "craft",
 		ConversationID:        conversationID,
 		RequestID:             requestID,
@@ -173,34 +227,58 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
 		CodebaseEnable:        false,
-		MaxToken:              0,
-		MaxSteps:              0,
-		Temperature:           0,
-		MaxRetries:            0,
 		MentionContexts:       []any{},
 		KnowledgeID:           []any{},
 		KnowledgeName:         []any{},
 		CodebaseID:            "",
 		MentionContextCount:   0,
 		Command:               "",
-		ExpertID:              "",
 		RecommendID:           "",
 		SkillID:               "",
-		SkillCount:            0,
-		TotalCount:            0,
-		FileURI:               "",
-		PresentAt:             now,
-		TraceID:               "",
+		TraceID:               session.NewTraceID(),
 		RootRequestID:         requestID,
 		ParentConversationID:  conversationID,
-		AgentName:             "default",
-		AgentType:             "conversation",
-		UserID:                a.UID,
+		AgentName:             "cli",
+		AgentType:             AgentTypeMain,
+		IsMaxMode:             true,
+		Source:                "work",
+		InputAttemptID:        session.NewConversationID(),
+		VcsType:               "unknown",
+		VcsRepo:               "",
+		VcsBranchName:         "",
+		VcsRevID:              "",
+		BuddyID:               "",
+		BuddyName:             "",
+
+		CodebuddySessionID:             conversationID,
+		CodebuddyConversationRequestID: requestID,
 	}
-	raw, err := json.Marshal([]chatRequestEvent{ev})
+	// 桌面指纹打底 + 业务字段优先（与 ReportDesktopEvent 同口径）：userId / timestamp /
+	// reportDelay / presentAt / 设备三元组都由 fingerprint 提供，事件结构不重复持有。
+	m := map[string]any{}
+	for k, v := range desktopFingerprint(a) {
+		m[k] = v
+	}
+	raw, err := json.Marshal(ev)
 	if err != nil {
 		return err
 	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	var biz map[string]any
+	if err := json.Unmarshal(raw, &biz); err != nil {
+		return err
+	}
+	for k, v := range biz {
+		m[k] = v
+	}
+	payload, err := json.Marshal([]map[string]any{m})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+reportPath, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	c.reportHeaders(req, a)
+	_, err = c.doJSON(req)
 	return err
 }

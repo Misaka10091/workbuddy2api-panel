@@ -524,15 +524,21 @@ func TestDailyCheckinAlready(t *testing.T) {
 }
 
 // TestDefaultCNChatBaseIsWorkbuddyCN 缺省 CN 主域必须是官方桌面端 product.json 的
-// endpoint；billing 保持 codebuddy.cn（CLI 任务计分依赖），global 不受影响。
+// endpoint；billing 域**同批切到 workbuddy.cn**（5.9.3 真机 billing 族 host 全是它），
+// global 不受影响。
+//
+// 反转点（2026-10-28，上游 8ecf115）：旧断言是 billing == codebuddy.cn（按「CLI 指纹域」
+// 推的），真机逐条抓包否证——checkin-activity-status 23 条、get-user-resource-* 12 条、
+// /activity/growth/* 13 条、trial + pay 5 条全部打 www.workbuddy.cn 且全 200。
+// 新语义：两个 CN base 同域，旧口径可用 cn.billing_base 回填。
 func TestDefaultCNChatBaseIsWorkbuddyCN(t *testing.T) {
 	c := New()
 	cn := &auth.Auth{Domain: ""}
 	if got := c.chatBase(cn); got != "https://www.workbuddy.cn" {
 		t.Errorf("CN chat base=%q want https://www.workbuddy.cn（官方桌面端主入口）", got)
 	}
-	if got := c.billingBase(cn); got != "https://www.codebuddy.cn" {
-		t.Errorf("billing base=%q want https://www.codebuddy.cn（CLI 任务计分依赖）", got)
+	if got := c.billingBase(cn); got != "https://www.workbuddy.cn" {
+		t.Errorf("billing base=%q want https://www.workbuddy.cn（5.9.3 真机 billing 族 host）", got)
 	}
 	if got := c.webBase(cn); got != "https://www.workbuddy.cn" {
 		t.Errorf("web base=%q want https://www.workbuddy.cn", got)

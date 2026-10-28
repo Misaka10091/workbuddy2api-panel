@@ -11,6 +11,7 @@ package upstream
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -101,6 +102,42 @@ func buildStableUUID(uid, conversation, purpose string) string {
 	var u [16]byte
 	copy(u[:], sum[:16])
 	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// buildTimeOrderedUUID 由 (uid, conversation, purpose) 稳定派生一个 UUID **v7**
+// 形态的 36 字符值（会话级 ID / acp-connection-id 的派生分支用）。
+//
+// 与 buildStableUUID（v4）的分工：5.9.3 真机的 X-Conversation-ID 与
+// acp-connection-id 都是时间有序的 v7（前 48 bit 毫秒时间、第 13 位恒 7），v4 在第
+// 13 位上直接可分。prompt_cache_key（buildCacheKey）**刻意仍是 v4**：它绑上游前缀
+// 缓存槽，改版本会让存量会话的缓存槽整体漂移一次，收益为负。
+//
+// 时间位**不能取 time.Now()**：同一个 (账号, 会话) 每轮都会换值，缓存槽全废。
+// 故 48 bit 时间位也做成哈希派生的伪时间：锚 2026-01-01T00:00:00Z + 24 个月窗口，
+// 落点是「一个合理的历史时刻」而不是越界假值。因此本函数仍是**纯函数**：
+// 同输入恒同值（跨进程也同值），输入不同则互异。
+func buildTimeOrderedUUID(uid, conversation, purpose string) string {
+	in := uid + "|" + conversation
+	if purpose != "" {
+		in += "|" + purpose
+	}
+	sum := sha256.Sum256([]byte(in))
+	const (
+		anchorMS = int64(1767225600000)                 // 2026-01-01T00:00:00Z
+		windowMS = int64(24 * 30 * 24 * 60 * 60 * 1000) // ≈24 个月
+	)
+	ms := uint64(anchorMS + int64(binary.BigEndian.Uint64(sum[8:16])%uint64(windowMS)))
+	var u [16]byte
+	u[0] = byte(ms >> 40)
+	u[1] = byte(ms >> 32)
+	u[2] = byte(ms >> 24)
+	u[3] = byte(ms >> 16)
+	u[4] = byte(ms >> 8)
+	u[5] = byte(ms)
+	copy(u[6:], sum[:10])
+	u[6] = (u[6] & 0x0f) | 0x70 // version 7
 	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }

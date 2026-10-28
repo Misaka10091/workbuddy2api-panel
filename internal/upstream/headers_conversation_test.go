@@ -22,6 +22,12 @@ func chatHeaderSet(t *testing.T, a *auth.Auth, meta ChatMeta) map[string]string 
 
 // TestChatHeadersAlwaysSendConversationTrio 三件套必须恒发：
 // 缺任一头上游回 400 code=11-128「conversation id missing」。
+//
+// 反转点（2026-10-28，上游 47f1ed6）：X-Root-Request-ID 从「恒等于轮级
+// conversationRequestID」改为**会话级根**——真实值由 handler 用
+// session.RequestIDForKey("root:"+会话键) 填进 ChatMeta.RootRequestID。
+// 新语义：无会话键的调用方（零值 meta）回落轮级（本用例覆盖），有根时两者不同值
+// （headers_parity_test.go 的 TestRootRequestIDSessionScoped 覆盖）。
 func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	// 零值 meta：夜猫子对话/面板任务这类无 body 会话概念的调用方。
@@ -39,8 +45,9 @@ func TestChatHeadersAlwaysSendConversationTrio(t *testing.T) {
 	if h["X-Request-Id"] != h["X-Conversation-Message-Id"] {
 		t.Error("X-Request-ID 应等于 X-Conversation-Message-ID")
 	}
+	// 无根请求 ID 时回落轮级（保持零值 meta 的既有形态）。
 	if h["X-Root-Request-Id"] != h["X-Conversation-Request-Id"] {
-		t.Error("X-Root-Request-ID 应等于 X-Conversation-Request-ID")
+		t.Error("无根请求 ID 时应回落 X-Conversation-Request-ID")
 	}
 }
 
@@ -55,12 +62,19 @@ func TestChatHeadersClientConversationIDWins(t *testing.T) {
 
 // TestChatHeadersCacheKeyIDFillsConversation 客户端没声明会话但网关有粘性会话键时，
 // 用与 prompt_cache_key 同源的隔离键填充（含账号段，跨账号不共用缓存槽）。
+//
+// 反转点（2026-10-28，上游 47f1ed6）：派生值形态从 UUID v4（buildCacheKey）改为
+// **UUID v7**（buildTimeOrderedUUID）——5.9.3 真机的会话级 ID 是时间有序 v7。
+// 隔离语义不变（uid 仍参与哈希输入）；prompt_cache_key 自身仍是 v4（不动）。
 func TestChatHeadersCacheKeyIDFillsConversation(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	h := chatHeaderSet(t, a, ChatMeta{CacheKeyID: "sess-abc"})
-	want := buildCacheKey("u1", "sess-abc")
+	want := buildTimeOrderedUUID("u1", "sess-abc", "")
 	if h["X-Conversation-Id"] != want {
 		t.Fatalf("X-Conversation-ID=%q，期望按会话键派生 %q", h["X-Conversation-Id"], want)
+	}
+	if !uuidV7Re.MatchString(h["X-Conversation-Id"]) {
+		t.Fatalf("派生命中必须是 UUID v7，得到 %q", h["X-Conversation-Id"])
 	}
 }
 

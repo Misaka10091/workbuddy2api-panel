@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -784,6 +786,13 @@ type Client struct {
 	// false（scope=identity）= 仅 system/developer。热改走 atomic，与上面同因。
 	SanitizeBrandAll atomic.Bool
 
+	// GzipMinChatBody chat 出站 body 的 gzip 阈值（字节）。0 = 用内置默认
+	// gzipMinChatBodyDefault（1024）。**做成字段而不是常量**的理由只有一个：测试要能
+	// 把它设成极大值等价关闭压缩（否则任何 `io.ReadAll(r.Body)` 后直接
+	// json.Unmarshal 的 wire 断言遇到 ≥1KB 的 body 会读到 gzip 字节）。
+	// 不是配置项：把测试细节泄漏成用户面没有收益。
+	GzipMinChatBody int
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -791,10 +800,10 @@ type Client struct {
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
-	// 空 = 内置默认（按 realm：CN 5.8.3 / global 5.8.4 分发包）。
+	// 空 = 内置默认（按 realm：CN 5.9.3 / global 5.8.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.161.0）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.165.0）。
 	CliVersion string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
@@ -846,10 +855,14 @@ func New() *Client {
 		// 三条路径两个域返回一致，workbuddy.cn 对海外出口也不复位握手（见
 		// cmd/server/config.go 的 cn.chat_base 注释）。
 		ChatBaseCN: "https://www.workbuddy.cn",
-		// BillingBaseCN 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
-		// 桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三类区分（README「任务计分」），
-		// 改这里会连带改掉 CLI 类任务的指纹来源。
-		BillingBaseCN: "https://www.codebuddy.cn",
+		// BillingBaseCN 同样取 www.workbuddy.cn（2026-10-28 切，上游 8ecf115）：
+		// 5.9.3 真机抓包里 billing 族的 host 全部是 www.workbuddy.cn
+		// （checkin-activity-status 23 条、get-user-resource-* 12 条、/activity/growth/*
+		// 13 条、/billing/ide/trial 与 /billing/pay/* 5 条），**没有一条**打
+		// codebuddy.cn，且全部 200。旧值 codebuddy.cn 是按「CLI 指纹域」推的，实测
+		// 不成立；两处口径不一致（查积分与实际计费走不同域）会得到互相矛盾的余额。
+		// config cn.billing_base 可退回旧域（空 = 本默认）。
+		BillingBaseCN: "https://www.workbuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
@@ -1139,7 +1152,9 @@ func (c *Client) refreshOnce(a *auth.Auth) refreshResult {
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	// body 是 `{}` 而不是 nil：5.9.3 真机 refresh 的 Content-Length 恒 2（nil body 会
+	// 发成 Content-Length: 0，是可直接判别的形态差）。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("{}"))
 	if err != nil {
 		return refreshResult{err: err}
 	}
@@ -1213,6 +1228,53 @@ func (c *Client) refreshOnce(a *auth.Auth) refreshResult {
 	}
 }
 
+// gzipMinChatBodyDefault chat 出站 body 压缩阈值（字节，含）。
+//
+// 5.9.3 真机抓包：较大的 chat body 以 `1f 8b` 开头并带 `Content-Encoding: gzip`。
+// 阈值取 1024 是保守值——小 body 压了反而更大（gzip 头 + 20 字节开销），压缩收益
+// 只在长 system prompt / 多轮历史这类 body 上出现。响应方向不变：Accept-Encoding
+// 仍刻意不设（显式设置会关闭 net/http 透明解压，收到 br 时网关没有解码器）。
+const gzipMinChatBodyDefault = 1024
+
+// gzipMinChatBody 生效的压缩阈值：Client.GzipMinChatBody 非 0 取之，否则内置默认。
+func (c *Client) gzipMinChatBody() int {
+	if c != nil && c.GzipMinChatBody > 0 {
+		return c.GzipMinChatBody
+	}
+	return gzipMinChatBodyDefault
+}
+
+// gzipBody 用 gzip.BestSpeed 压缩（客户端用 zlib 默认级别；上游只解码不校验压缩率，
+// 故优先省 CPU）。
+func gzipBody(src []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(src); err != nil {
+		zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// maybeGzipChatBody 按阈值压缩出站 chat body，返回压缩结果与是否已压缩。
+// 任一失败（写/关闭）都返回原文 + false：压缩失败绝不能把请求也弄死。
+func (c *Client) maybeGzipChatBody(prepared []byte) ([]byte, bool) {
+	if len(prepared) < c.gzipMinChatBody() {
+		return prepared, false
+	}
+	z, err := gzipBody(prepared)
+	if err != nil {
+		return prepared, false
+	}
+	return z, true
+}
+
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
@@ -1248,16 +1310,22 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// 出站 body 压缩（5.9.3 真机：body 以 1f 8b 开头、带 Content-Encoding: gzip）。
+	// 失败静默发明文——压缩是纯优化，不能因为它的失败把请求也弄死。
+	outBody, gzipped := c.maybeGzipChatBody(prepared)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(outBody))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if gzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
@@ -1894,7 +1962,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	c.injectCodeBuddyRequest(req)
+	// X-Request-ID 是 /v3/config 黄金头集里的一员（32 hex 消息 ID 形态）；
+	// X-CodeBuddy-Request **不发** —— 5.9.3 真机业务路径一条都没带，只有 chat 带。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err

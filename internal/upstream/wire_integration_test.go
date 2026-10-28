@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -122,5 +123,84 @@ func TestOutboundWireForm(t *testing.T) {
 	}
 	if lastUser["agent"] != agentCLI {
 		t.Errorf("agent=%v want %q", lastUser["agent"], agentCLI)
+	}
+}
+
+// TestChatBodyGzipThreshold chat 出站 body 按阈值 gzip：只有 ≥ 阈值才压，且**只在压缩
+// 成功时**设置 Content-Encoding；阈值调到极大等价于关闭压缩（设计裁决：GzipMinChatBody
+// 是 Client 字段而不是配置项/包级常量，就是为了让 wire 断言能这样关掉它）。
+//
+// 来源：5.9.3 真机 body 以 `1f 8b` 开头、带 `Content-Encoding: gzip`（上游 47f1ed6）。
+// 反向保护：压缩不得改变 body 语义，小 body 必须保持明文（否则所有既有 wire 断言都得
+// 先解压，测试维护面直接翻倍）。
+func TestChatBodyGzipThreshold(t *testing.T) {
+	big := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"` +
+		strings.Repeat("x", 2000) + `"}]}`)
+	small := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
+
+	for _, tc := range []struct {
+		name     string
+		body     []byte
+		minBody  int // 0 = 用内置默认阈值
+		wantGzip bool
+	}{
+		{"small_body_plain", small, 0, false},
+		{"large_body_gzip", big, 0, true},
+		{"threshold_disabled_equivalently", big, 1 << 30, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotEncoding string
+			var gotBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotEncoding = r.Header.Get("Content-Encoding")
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			}))
+			defer srv.Close()
+
+			c := New()
+			c.HTTP = srv.Client()
+			c.ChatHTTP = srv.Client()
+			c.ChatBaseCN = srv.URL
+			c.GzipMinChatBody = tc.minBody
+
+			rc, status, respBody, err := c.ChatStreamContext(context.Background(),
+				&auth.Auth{UID: "u-1", AccessToken: "at"}, tc.body, "", ChatMeta{})
+			if rc != nil {
+				_ = rc.Close()
+			}
+			if err != nil || status >= 400 {
+				t.Fatalf("chat: status=%d err=%v body=%s", status, err, respBody)
+			}
+
+			payload := gotBody
+			if tc.wantGzip {
+				if gotEncoding != "gzip" {
+					t.Fatalf("Content-Encoding=%q want gzip（body 超阈值）", gotEncoding)
+				}
+				if len(gotBody) < 2 || gotBody[0] != 0x1f || gotBody[1] != 0x8b {
+					t.Fatalf("body 不是 gzip 流（前两字节 %x）", gotBody[:min(2, len(gotBody))])
+				}
+				zr, zerr := gzip.NewReader(strings.NewReader(string(gotBody)))
+				if zerr != nil {
+					t.Fatalf("gunzip: %v", zerr)
+				}
+				defer zr.Close()
+				if payload, zerr = io.ReadAll(zr); zerr != nil {
+					t.Fatalf("read gunzip: %v", zerr)
+				}
+			} else if gotEncoding != "" {
+				t.Fatalf("Content-Encoding=%q want 空（不该压缩）", gotEncoding)
+			}
+
+			var obj map[string]any
+			if err := json.Unmarshal(payload, &obj); err != nil {
+				t.Fatalf("出站 body 不是 JSON: %v", err)
+			}
+			if obj["stream"] != true {
+				t.Error("压缩不该改变 body 语义（stream 应仍为 true）")
+			}
+		})
 	}
 }

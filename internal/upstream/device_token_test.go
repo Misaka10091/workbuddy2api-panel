@@ -24,7 +24,9 @@ func TestDeviceTokenInjected_WhenSet(t *testing.T) {
 		wantPath string
 	}{
 		{"chat", func(c *Client, req *http.Request) { c.ChatHeaders(req, a, "", ChatMeta{}) }, "/v2/chat/completions"},
-		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, a) }, "/v2/report"},
+		// billing 族样本用真实计费路径：/v2/report 自 2026-10-28（5.9.3 同步）起改走
+		// chatBase + 自建 reportHeaders，**不再**经过 BillingHeaders。
+		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, a) }, "/v2/billing/meter/get-user-resource"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got string
