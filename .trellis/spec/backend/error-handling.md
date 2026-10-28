@@ -55,7 +55,12 @@ IsModelBlocked(11102/11158, 仅 400/404)
 
 `14003`（模型忙）必须在 `IsModelRateLimit` 之前判，否则会套上 `soft_rate` 的 600s→2h 阶梯，把一次抖动放大成整池十分钟不可用；6004/6000 的配额判断同样要先排除 14003。
 
-另外 **6004/6000 的处置有前置条件**：只有 body 里解析出「将在 … 重置」的时间时才是"只写模型级、不写 `until`"；没有重置文案时走的是**账号级** `CooldownSoftRate`，模型条目只落一条审计（不产生模型豁免）。因此"6004 后切个模型就能继续用"只在带重置文案的形态下成立。
+另外 **6004/6000 的作用域恒定是模型级**：只要 body 明确指向模型限流，就只写 `modelCooldowns[model]`、**不写账号级 `until`**，该账号切模型立即可用。有无「将在 … 重置」文案只影响"停到什么时候"：
+
+- 有重置时间 → `Until = 上游墙钟`，**不被 `soft_rate_max` 截短**（截短等于在上游恢复前再送一次必然失败的请求）；只对明显脏值兜底（已过期→立即恢复、超 7 天→按 7 天钳制）。
+- 无重置时间 → 模型级有界退避（`soft_rate` 基数起、按该 `(账号, 模型)` 命中次数翻倍、封顶 `soft_rate_max`）。
+
+`model == ""`（请求没带模型名，无法归属）才回落账号级 `CooldownSoftRate`。
 
 ## 处置矩阵
 
@@ -65,10 +70,11 @@ IsModelBlocked(11102/11158, 仅 400/404)
 |---|---|:---:|:---:|---|
 | 429（账号级，非 6004） | `ErrSoftRate` | 是 | 账号级软冷却（指数退避，封顶 `soft_rate_max`） | 429 `rate_limit_exceeded` |
 | 429 + 6004/6000，**body 带「将在 … 重置」文案** | `ErrSoftRate` + `IsModelRateLimit` | 是 | **仅模型级** `CooldownSoftForModel`：写 `modelCooldowns[model]`、按上游墙钟，**不写 `until`**；该账号切模型立即可用 | 429，`code` 为数字 6004/6000，**无 `Retry-After`** |
-| 429 + 6004/6000，**无重置文案** | 同上 | 是 | **账号级** `CooldownSoftRate`（有 `Retry-After` 头则冷却到该时刻，否则 `soft_rate` 有界退避）+ `RecordModelRateLimitAudit`：模型条目只作审计展示，**不产生模型豁免** | 同上 |
-| 14003 模型忙 | `ErrSoftRate` + `IsModelBusy` | 是 | 模型级"忙"冷却（10s 起，×2，封顶 1m），不套 `soft_rate` 阶梯 | 503 `model_busy` + `Retry-After` |
+| 429 + 6004/6000，**无重置文案** | 同上 | 是 | **仍仅模型级** `CooldownSoftForModel`（`resetAt` 零值分支）：模型级有界退避，账号级 `until` 不动；同号换模型立即可用 | 同上 |
+| 14003 模型忙 | `ErrSoftRate` + `IsModelBusy` | 是 | 模型级"忙"冷却（10s 起，×2，封顶 1m），不套 `soft_rate` 阶梯；**上游给 `Retry-After` 时采信它并钳到 1m** | 503 `model_busy` + `Retry-After` |
 | 402 / 10001 / 14001 / 余额标记 | `ErrHardCredit` | 是 | 硬冷却到次日 04:00 | 最终 503 |
-| 401 + 12153（**聊天路径**） | `ErrSessionDead` | 是 | **立即 `Disable`**（`"12153 session dead"`） | 按剩余可用决定 |
+| 401 + 12153（**聊天路径**，业务信封） | `ErrSessionDead` | 是 | **立即 `Disable`**（`"12153 session dead"`）：业务层明确判死 | 按剩余可用决定 |
+| 网关 401（HTML 页）+ refresh 判死 | `ErrSessionDead` + `IsGatewayUnauthorized` | 是 | `NoteSessionDead` 连续 3 次才禁用（误判防护；网关拦截会成串出现，单次求证失败不等于号死） | 按剩余可用决定 |
 | 401 + 12153（**保活任务**） | `ErrSessionDead` | — | `NoteSessionDead` 连续 3 次才禁用，刷新成功则清零（P0-1：13 个 disabled 号全是立即杀号的误判） | — |
 | 11102 / 11158 | `ErrModelBlocked` | 是 | 模型级封禁（6h 起，×2，封顶 24h） | 400 `model_unavailable` |
 | 6020 / 6021 渠道排队/队列满 | `ErrUpstreamBusy` | **否：立即返回** | **否**（`applyErrorPolicy` 该分支零动作） | 503 `upstream_busy` + `Retry-After`（上游未给时 5s） |
@@ -111,8 +117,12 @@ func VerifySessionByRefresh(...) VerifyVerdict
 
 - 刷新成功 = Alive；应用层 4xx `*Error` = Dead；5xx / 429 / WAF / 网关 401 = **Inconclusive**（既不算活也不算死）。
 - 网关侧 401 必须先验证再处置：刷新后仍 401 才按登录态失效处理。
-- 验证为 Dead 之后，**聊天路径立即 `Disable`**（这一次请求已经实证不可用，继续留在池里只会再失败一次）；**保活路径**才走 `NoteSessionDead` 的三次连续计数。两条路径的阈值不同是刻意的，不要把其中之一当成"统一状态机"。
-- "Dead 但可用"（`SessionDeadButUsable`）只用于刷新前的路径。
+- 验证为 Dead 之后分两种：
+  - **业务信封 12153（聊天路径）**：立即 `Disable`——业务层明确判死，继续留在池里只会再失败一次。
+  - **网关 401（HTML 页）求证判死**：走 `NoteSessionDead` 连续 3 次。网关拦截在风控窗口里会成串出现，单次求证失败就永久踢号，等于让一次边缘风控升级成人工重登。与保活同口径。
+- 三条路径的取舍：业务层明确判死最可信（立即禁用）；网关层判词要连续取证；保活只看 AT 是否还能用。
+- "Dead 但可用"（`SessionDeadButUsable`）只用于刷新前的路径（保活 / 余额探测 / 请求前预刷新），**不用于 chat 拿到 401 之后**——那里 AT 已被上游拒过。
+- 「请求前预刷新判死但 AT 仍有效」= 容忍这一次（不罚不禁、用现有 AT 走完这一跳）；AT 也已过期才禁用。
 
 ## Go 侧错误风格
 
@@ -127,8 +137,10 @@ func VerifySessionByRefresh(...) VerifyVerdict
 - 用 `err.Error()` 字符串包含判断错误类型。
 - 新增错误类别却不更新 [http-api-layer.md](./http-api-layer.md) 的状态码映射表与面板提示。
 - 把 `Inconclusive` 当成 Dead 处理（会误禁号）。
-- 把保活任务的"连续 3 次才禁用"套到聊天路径（会让一次实证失效的号继续被选中）。
+- 在网关 401 求证里用裸 `break` 终止轮转：它只跳出 `switch`，会落回循环外收尾，把同一次失败按第二个错误类别再罚一遍（`VerifyAlive` 因此把刚刷新成功的号 `Disable`）。轮转循环终止一律用 `break rotate`。
+- 把「刷新失败」等同于「账号不可用」：`SessionDeadButUsable`（AT 未过期）时该号 chat 仍然通。
 - 把 6020/6021 当账号故障去换号（放大无效请求，且会喂成整池停摆）。
-- 把"6004 只写模型级冷却"当成无条件规则（无重置文案时实际是账号级冷却）。
+- 把 6004 的**无重置文案**形态写成账号级冷却：那是模型级信号，冷整号会连带切断同号的其他模型（旧行为，已改）。
+- 用 `soft_rate_max` 截短模型级的上游重置时刻：那会在上游恢复前再送一次必然失败的请求。
 - 给 6004 配额响应加 `Retry-After`（客户端会整段睡死）。
 - 在 `internal/upstream` 里调用 `pool` 的方法（依赖方向不允许，且会把惩罚决策埋进协议层）。

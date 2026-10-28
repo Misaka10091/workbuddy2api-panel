@@ -96,9 +96,7 @@ func (p *Pool) startFlusher() {
 			select {
 			case <-t.C:
 				p.mu.Lock()
-				if p.dirty.Swap(false) {
-					p.saveLocked()
-				}
+				p.flushLocked()
 				p.mu.Unlock()
 			case <-stopCh:
 				return
@@ -107,26 +105,64 @@ func (p *Pool) startFlusher() {
 	}()
 }
 
+// flushLocked 「脏才写、写成功才清脏」的唯一实现。调用方必须已持有 p.mu。
+//
+// 为什么不能 dirty.Swap(false) 之后再写：写失败（磁盘满/权限丢）时脏标记已被清掉，
+// 下一次 tick 看到 dirty=false 就什么都不做——冷却、禁用、连续 12153 计数从此停在
+// 内存里，直到进程重启全部丢失。旧实现就是这个形状，属于"静默丢状态"。
+func (p *Pool) flushLocked() {
+	if !p.dirty.Load() {
+		return
+	}
+	if err := p.saveLocked(); err != nil {
+		return // 保持脏：下一轮 flusher 自动重试（notePersistFail 已按节流记日志）
+	}
+	p.dirty.Store(false)
+}
+
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) {
-		p.saveLocked()
-	}
+	p.flushLocked()
 	p.mu.Unlock()
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+//
+// 读取顺序：主文件 → 备份。主文件损坏/不可读时用 .bak 顶上，并把坏文件改名
+// state.json.corrupt 保留证据（否则下次启动会再踩同一个坏文件，且运维看不到它）。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
-	if err != nil {
+	if p.stateFp == "" {
 		return
+	}
+	if p.loadStateFile(p.stateFp) {
+		return
+	}
+	if _, err := os.Stat(p.stateFp); err != nil {
+		return // 主文件不存在：首次启动，无可恢复
+	}
+	if !p.loadStateFile(p.stateFp + ".bak") {
+		return // 备份也没有/也坏：保持空池（旧行为），由后续 Add 重建
+	}
+	if err := os.Rename(p.stateFp, p.stateFp+".corrupt"); err != nil {
+		log.Printf("pool: state.json 损坏且备份已采用，但坏文件改名失败: %v", err)
+		return
+	}
+	log.Printf("pool: state.json 损坏，已从 state.json.bak 恢复（坏文件改名为 state.json.corrupt）")
+}
+
+// loadStateFile 解析并采用一个状态文件；返回是否成功。
+func (p *Pool) loadStateFile(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
 	}
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
-		return
+		return false
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	return true
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -228,28 +264,42 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
 }
-func (p *Pool) saveLocked() {
+// saveLocked 落盘并返回是否成功。成功路径负责清零 persistFails 并镜像 Redis 快照；
+// 失败路径只记节流日志，由调用方（flushLocked）保留 dirty 以便下一轮重试。
+//
+// 写入序列：tmp（含 fsync）→ 主文件轮转为 .bak → rename → 目录 fsync。
+// 只 WriteFile + rename 的话，掉电后可能拿到"长度对、内容空"的主文件；
+// .bak 则让"主文件解析失败"变成可恢复，而不是静默把整池状态归零。
+func (p *Pool) saveLocked() error {
 	if p.stateFp == "" {
-		return
+		return nil
 	}
 	sf := p.stateOverviewLocked()
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		p.notePersistFail(err)
-		return
+		return err
 	}
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
 	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := writeFileSync(tmp, raw); err != nil {
 		p.notePersistFail(err)
-		return
+		return err
+	}
+	// rename 会用 tmp 覆盖主文件，覆盖前先留一份可用副本；备份失败不阻断落盘
+	// （主文件本身仍然可用，只是少一层容错）。
+	if _, statErr := os.Stat(p.stateFp); statErr == nil {
+		if bakErr := copyFileSync(p.stateFp, p.stateFp+".bak"); bakErr != nil {
+			log.Printf("pool: state.json 备份失败（不影响本次落盘）: %v", bakErr)
+		}
 	}
 	if err := os.Rename(tmp, p.stateFp); err != nil {
 		p.notePersistFail(err)
-		return
+		return err
 	}
+	syncDir(filepath.Dir(p.stateFp))
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -262,6 +312,48 @@ func (p *Pool) saveLocked() {
 			p.store.SaveState(snapRaw)
 		}
 	}
+	return nil
+}
+
+// writeFileSync 写入并 fsync 后再关闭：状态文件要在掉电后仍能读回完整内容。
+// 权限保持 0o600（与既有落盘一致，凭证态文件不对外可读）。
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// copyFileSync 复制状态文件（用于 .bak 轮转）；目标同样 fsync，避免备份是空壳。
+func copyFileSync(src, dst string) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return writeFileSync(dst, raw)
+}
+
+// syncDir 把目录项刷盘（rename 之后）。Windows 上打开目录会失败，忽略即可——
+// 目标是"能刷就刷"，不是"刷不了就失败"。
+func syncDir(dir string) {
+	if dir == "" {
+		return
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：

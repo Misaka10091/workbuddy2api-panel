@@ -364,6 +364,12 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 		t.Fatalf("precondition: 前 2 次不应禁用: %+v", st)
 	}
 	s.RunKeepaliveNow() // 刷新成功 → 清计数
+	// 这次刷新把 AT 换成了新的（expiresIn=3600），而「RT 失效但 AT 仍有效」已经
+	// 不再计死（见保活分支）。本测试要验的是「计数被清零」，所以把 AT 拨回过期态，
+	// 让后续 12153 是真正的登录态失效。
+	a.Lock()
+	a.ExpiresAt = 1
+	a.Unlock()
 	// 接下来连续 2 次 12153：从新计数重新算，仍不应禁用（历史计数已清）。
 	s.RunKeepaliveNow() // 12153 #1（新计数）
 	s.RunKeepaliveNow() // 12153 #2（新计数）
@@ -373,6 +379,38 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	s.RunKeepaliveNow() // 12153 #3（新计数）→ 禁用
 	if st, _ := p.Status("u1"); !st.Disabled {
 		t.Fatalf("新计数第 3 次 12153 应禁用: %+v", st)
+	}
+}
+
+// TestRunKeepaliveSessionDeadButAtUsable 「RT 失效但 AT 仍有效」不计 session dead：
+// 这种号此刻 chat 仍然通，计死会让它在几轮保活后被永久禁用。判据唯一稳定来源是
+// upstream.SessionDeadButUsable（AT 是否还能用），不是上游文案。
+func TestRunKeepaliveSessionDeadButAtUsable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{
+		UID: "u1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(6 * time.Hour).Unix(),
+	}
+	p.Add(a)
+	up := &upstream.Client{
+		HTTP:          srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+	}
+	s := New(Config{Pool: p, Upstream: up})
+
+	// 超过阈值两轮：若仍按旧口径累计，第三轮就会禁用。
+	for i := 0; i < pool.SessionDeadThreshold()+2; i++ {
+		s.RunKeepaliveNow()
+	}
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("AT 仍有效时 refresh 判死不得禁用账号: %+v", st)
 	}
 }
 

@@ -95,15 +95,15 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 |------|------|------|--------|
 | 429 无重置时间 | `CooldownSoftRate` | `d << (streak-1)`，封顶 `soft_rate_max` | `cooldown.soft_rate` / `cooldown.soft_rate_max` |
 | 429 有重置时间 | 同上 | `min(上游重置时刻, now+soft_rate_max)`，**绝不指数堆加** | 同上（只取上界） |
-| 6004/6000 **且 body 有**「将在 … 重置」 | `CooldownSoftForModel` | 只写 `modelCooldowns[model]`（保留上游墙钟），**不写账号级 `until`** → 切模型即可用 | `soft_rate_max` 仅作上界 |
-| 6004/6000 **但无重置文案** | `CooldownSoftRate` + `RecordModelRateLimitAudit` | 账号级冷却（有 `Retry-After` 头则到该时刻，否则 `soft_rate` 有界退避）；模型条目只作审计展示，**不产生模型豁免** | `cooldown.soft_rate*` / `soft_rate_max` |
-| 14003 模型忙 | `CooldownModelBusy` | 10s 起 ×2，封顶 1m | 硬编码 |
+| 6004/6000 **且 body 有**「将在 … 重置」 | `CooldownSoftForModel` | 只写 `modelCooldowns[model]`，`Until = 上游墙钟`、**不被 `soft_rate_max` 截短**（只钳明显脏值：已过期→立即恢复、超 7 天→7 天），**不写账号级 `until`** → 切模型即可用 | 硬编码 7 天上限 |
+| 6004/6000 **但无重置文案** | `CooldownSoftForModel`（`resetAt` 零值） | **仍是模型级**有界退避（`d << (hits-1)`，封顶 `soft_rate_max`）；账号级 `until` 不动。`model == ""` 才回落账号级 `CooldownSoftRate` | `cooldown.soft_rate*` / `soft_rate_max` |
+| 14003 模型忙 | `CooldownModelBusy` / `CooldownModelBusyWithWait` | 10s 起 ×2，封顶 1m；**带 `Retry-After` 时采信该值并钳到 1m** | 硬编码 |
 | 402 余额耗尽 | `CooldownUntilTomorrow4AM` | 到本地 04:00（04:00 前则今天 04:00） | 硬编码 |
 | 404 | handler 调 `Cooldown(CoolSoft, 60s)` | 固定 60s，不推进 streak | 硬编码（有意不复用 `soft_rate`） |
 | 11102/11158 | `BlockModelBackoff` | 6h 起 ×2，封顶 24h | 硬编码 |
 | 5xx 熔断 | `recordBreakerFailureLocked` | `breaker_cooldown << retryCount`，封顶 `breaker_cooldown_max` | `pool.breaker_threshold` / `breaker_cooldown` / `breaker_cooldown_max` |
 | 未分类失败 | `NoteFailures` | 固定 `degrade_cooldown`，封顶 `degrade_cooldown_max` | `pool.degrade_threshold` / `degrade_cooldown` / `degrade_cooldown_max` |
-| 登录态连续失效（**仅保活任务**） | `NoteSessionDead` | 连续 3 次 → disable；刷新成功清零 | 硬编码阈值（聊天路径不走上限，直接 `Disable`） |
+| 登录态失效（**保活 / 网关 401 求证判死**） | `NoteSessionDead` | 连续 3 次 → disable；刷新成功清零。**业务信封 12153 的聊天路径仍直接 `Disable`**（业务层明确判死） | 硬编码阈值 |
 | 在途租约（普通号） | `Acquire`/`Release` | `pool.max_in_flight`：**`0 = 不限`**，>0 即该值 | `pool.max_in_flight` |
 | 在途租约（global 分档） | `Acquire`/`Release` | `pool.max_in_flight_global`：**`<=0` 在 `normalize()` 里回落为 2**（分档键的 0 没有"不限"语义，见 `config.go` 注释），>0 即该值 | `pool.max_in_flight_global` |
 
@@ -111,8 +111,10 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 
 ## 落盘与 Redis 镜像（`persist.go`）
 
-- 文件格式 `stateFile{accounts: map[uid]stateAccount}`，`MarshalIndent` 两空格、`0o600`、`tmp` + `os.Rename` 原子发布，目录 `0o755`。
-- 周期 5s（`flushInterval`）后台 flush；`Flush()` 用 `dirty.Swap(false)` 幂等；`Close()` 停 goroutine 并做最后一次 flush。flusher 启动前必须把 `stopCh` 抓到局部变量（`-race` 与 nil channel 死锁的教训）。
+- 文件格式 `stateFile{accounts: map[uid]stateAccount}`，`MarshalIndent` 两空格、`0o600`，目录 `0o755`。
+- **写入序列**：`tmp` → `Write` → `fsync` → `Close` → 主文件轮转为 `state.json.bak` → `rename` → 目录 `fsync`。只 `WriteFile`+`rename` 时，掉电可能留下"长度对、内容空"的主文件——那比写失败更糟，因为它看起来有效。
+- **dirty 语义：写成功才清**。周期 5s 后台 flush 走 `flushLocked()`：`dirty` 为真才写，`saveLocked()` 返回 nil 才 `dirty.Store(false)`。旧形状 `dirty.Swap(false)` 之后才写，写失败（磁盘满/权限丢）时脏标记已清，下一轮什么都不做——冷却、禁用、连续 12153 计数从此只留在内存里。`Close()` 停 goroutine 并做最后一次 flush；flusher 启动前必须把 `stopCh` 抓到局部变量（`-race` 与 nil channel 死锁的教训）。
+- **损坏恢复**：主文件不可读/解析失败 → 读 `state.json.bak`；成功则采用，并把坏文件改名 `state.json.corrupt`（保留证据，否则下次启动再踩同一个坏文件）。主文件不存在 = 首次启动，不尝试备份。
 - **落盘字段规则**：
   - 截止时间用 `*time.Time` + `omitempty`，并且**只在仍在将来时写**；恢复时同样过滤。非指针 `time.Time` 会被序列化成 `0001-01-01T00:00:00Z`。
   - 计数器（`err_total` / `success_count` 等）**不要** `omitempty`：零值缺失会让人误以为"没记录"。
@@ -175,7 +177,8 @@ routing  = weight * (近过期 && prefer_expiring ? 3 : 1)
 ## 反模式
 
 - 在 `internal/scheduler` 或 `internal/server` 直接改 `entry` 字段（绕过 `transition.go`）。
-- 把 6004/6000 **无条件**写成账号级冷却：只有 body 无重置文案时才是账号级；带重置文案时写账号级 `until` 会把单模型限流升级成整号冷却。
+- 把 6004/6000 写成**账号级**冷却：它是模型级信号，写账号级 `until` 会把单模型限流升级成整号冷却、切模型也救不回来（无重置文案时同样如此）。
+- 用 `soft_rate_max` 截短模型级的上游重置时刻：那会在上游恢复前再送一次必然失败的请求。
 - 在 `NoteSuccess` 里顺手清 `modelCooldowns`。
 - 让 `reviveCoolingLocked` 清掉 `softStreak` / breaker。
 - 给状态文件计数器加 `omitempty`，或给截止时间用非指针 `time.Time`。
