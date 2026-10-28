@@ -91,25 +91,51 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelKeepsUpstreamReset 6004 带「将在 … 重置」时，模型冷却
+// 截止**完整遵守**上游墙钟，不再被 soft_rate_max 截短：截短等于在上游恢复前再送一次
+// 必然失败的请求。reset_at 同时保留原始墙钟（台账语义），账号级 until 仍不写。
+func TestCooldownSoftForModelKeepsUpstreamReset(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max：那是账号级上界
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	until := p.byUID["u1"].until
 	p.mu.RUnlock()
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("Until=%v want ~%v（模型级不得被 soft_rate_max 截短）", mc.Until, reset)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+		t.Errorf("ResetAt=%v want ~%v", mc.ResetAt, reset)
+	}
+	if !until.IsZero() {
+		t.Errorf("until=%v 应零值（6004 不写账号级冷却）", until)
+	}
+}
+
+// TestModelSoftUntilClampsDirtyReset 只兜两种明显脏值：已过期 → 立即恢复（不白锁）；
+// 超过 7 天 → 钳到 7 天（防一条错误文案把模型停到遥不可及的未来）。合理值原样遵守。
+func TestModelSoftUntilClampsDirtyReset(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+
+	past := modelSoftUntilLocked(now, now.Add(-time.Hour))
+	if !past.After(now) || past.Sub(now) > time.Second {
+		t.Errorf("已过期的重置时间应立刻恢复，得到 %v", past.Sub(now))
+	}
+
+	far := modelSoftUntilLocked(now, now.Add(30*24*time.Hour))
+	if d := far.Sub(now); d < maxModelSoftReset-time.Second || d > maxModelSoftReset {
+		t.Errorf("超长重置时间应钳到 %v，得到 %v", maxModelSoftReset, d)
+	}
+
+	want := now.Add(3 * time.Hour)
+	if got := modelSoftUntilLocked(now, want); !got.Equal(want) {
+		t.Errorf("合理重置时间应原样遵守，得到 %v", got)
 	}
 }
 

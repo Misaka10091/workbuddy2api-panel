@@ -670,6 +670,15 @@ func (s *Scheduler) runKeepalive(ctx context.Context, realm string, spreadOn boo
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
+				// RT 失效 ≠ 账号不可用：AT 未过期时上游 chat 仍然正常（verify.go 的
+				// 唯一稳定判据就是 AT 还能不能用）。把这类号计进连续 12153，几轮保活
+				// 之后就会把一个完全健康的号永久禁用——这正是「一刷新就掉号」的成因。
+				if upstream.SessionDeadButUsable(a) {
+					log.Printf("keepalive %s: RT 已失效但 AT 仍可用（至 %s）— 不计 session dead",
+						logfmt.Label(st.UID, st.Nickname),
+						time.Unix(a.ExpiresAtValue(), 0).Format(time.RFC3339))
+					continue
+				}
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}

@@ -105,7 +105,7 @@ server.read_timeout
 | `global.chat_base`、`global.billing_base` | `up.ChatBaseGlobal`、`up.BillingBaseGlobal` | 出站 base 装配后固定 |
 | `upstream.client_version`、`cli_version`、`client_name` | `up.ClientVersion` / `up.CliVersion` / `up.ClientName` | 出站 UA 与归属头在装配期定型 |
 | `upstream.device_token`、`device_token_file`、`passthrough_ip` | `up.DeviceToken` / `up.DeviceTokenFile` / `up.PassthroughIP` | 同上 |
-| `budget.daily_limit`、`burst_limit`、`cache_low_rate` | `server.Config` → `NewHandler` 构造 `dailyBudget` | 已加进 `restartRequiredFields`（>0 时提示） |
+| `budget.daily_limit`、`burst_limit`、`cache_low_rate` | `saveConfig` → `budgetHook` → `Handler.SetBudgetLimit` / `SetBudgetGuards` | **热生效**：保存即改运行中的 `dailyBudget`，不再列入 `restartRequiredFields` |
 
 ### 2026-10 新增键的热生效状态
 
@@ -114,7 +114,7 @@ server.read_timeout
 | `features.sanitize_brand_scope` | 热生效：`saveConfig` 写 `up.SanitizeBrandAll` |
 | `models.allowed` | 热生效：进 `livecfg.Snapshot.AllowedModels` |
 | `schedule.account_spread_minutes` / `account_spread_min_gap_seconds` / `night_chat_cap` | 热生效：`sch.SetAccountSpread` |
-| `budget.*` | 装配期（见上表） |
+| `budget.*` | 热生效：`saveConfig` 经 `budgetHook` 调 `SetBudgetLimit` / `SetBudgetGuards` |
 
 写新代码时的正确规则是两条：
 

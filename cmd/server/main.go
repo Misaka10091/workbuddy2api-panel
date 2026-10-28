@@ -287,6 +287,11 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	// budgetHook 把「面板保存配置」接到 handler 的预算闸上。面板回调在 handler
+	// 之前装配，所以先留一个可替换的钩子；handler 建好后填上。nil 时保存配置
+	// 只落盘不热改（等价旧行为），不会 panic。
+	var budgetHook func(limit, burst, cacheLow float64)
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -310,14 +315,14 @@ func main() {
 		SaveKeys: func(keys []apikeys.Key) error {
 			_, err := saveConfig(
 				mergedJSON(map[string]any{"api_keys": keys}),
-				*cfgPath, live, p, up, sch, keyStore)
+				*cfgPath, live, p, up, sch, keyStore, budgetHook)
 			return err
 		},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch, keyStore)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, keyStore, budgetHook)
 		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
@@ -352,6 +357,14 @@ func main() {
 		BudgetBurst:        cfg.Budget.BurstLimit,
 		BudgetCacheLowRate: cfg.Budget.CacheLowRate,
 	})
+
+	// 预算闸热改接线：面板保存配置后直接改闸门，不必重启。
+	// 异常耗分（某天突然打穿上限）时，"保存即止损"比"保存 + 提示重启 + 人工重启"
+	// 的实际生效时间差几个数量级，而这段时间正是最贵的。
+	budgetHook = func(limit, burst, cacheLow float64) {
+		h.SetBudgetLimit(limit)
+		h.SetBudgetGuards(burst, cacheLow)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -502,7 +515,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, keys *apikeys.Store) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, keys *apikeys.Store, setBudget func(limit, burst, cacheLow float64)) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -580,6 +593,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	// 预算闸热改：直接改运行中的 dailyBudget，不再要求重启（见 budgetHook 装配处）。
+	// setBudget 为 nil = 没有 handler（测试/裸用路径），保持"只落盘"的旧行为。
+	if setBudget != nil {
+		setBudget(newCfg.Budget.DailyLimit, newCfg.Budget.BurstLimit, newCfg.Budget.CacheLowRate)
+	}
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -637,17 +655,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
-	// 积分闸在 NewHandler 里装配成 dailyBudget 快照，保存配置不重建 handler，
-	// 因此按装配期字段处理（>0 才提示；0 = 关闭时改 0 本来也无副作用）。
-	if c.Budget.DailyLimit > 0 {
-		out = append(out, "budget.daily_limit")
-	}
-	if c.Budget.BurstLimit > 0 {
-		out = append(out, "budget.burst_limit")
-	}
-	if c.Budget.CacheLowRate > 0 {
-		out = append(out, "budget.cache_low_rate")
-	}
+	// budget.* 不再列入：saveConfig 通过 budgetHook 直接调用 SetBudgetLimit /
+	// SetBudgetGuards，保存即生效。此前它们被当成装配期字段，用户改完只看到
+	// "需要重启"，而异常耗分正是最需要立刻止损的时刻。
 	return out
 }
 

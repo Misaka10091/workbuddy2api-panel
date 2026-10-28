@@ -870,20 +870,51 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelNotCappedBySoftRateMax(t *testing.T) {
+	// 上游明确重置时间就是权威恢复时刻：即使远超 soft_rate_max 也原样遵守
+	// （soft_rate_max 只约束账号级冷却，以及模型级"无重置时间"时的有界退避上界）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
-	before := time.Now()
-	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
+	reset := time.Now().Add(2 * time.Hour) // 远超 soft_rate_max，仍应遵守
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
 	}
-	if st.RateLimitedModels[0].Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v（不得被 soft_rate_max 截短）",
+			st.RateLimitedModels[0].Until, reset)
+	}
+	if st.Cooling {
+		t.Errorf("6004 不应产生账号级冷却: %+v", st)
+	}
+}
+
+// TestCooldownSoftForModelNoResetStaysModelLevel 无重置时间的 6004 只停 (账号, 模型)：
+// 账号级 until 不动，切模型立即可用；同一模型重复命中不堆加（冷却中不推进阶梯）。
+func TestCooldownSoftForModelNoResetStaysModelLevel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(time.Hour)
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "glm-5.3", "6004 model rate limit (reset unknown)")
+
+	st, _ := p.Status("u1")
+	if st.Cooling {
+		t.Fatalf("无重置时间的 6004 不得冷整个账号: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("应只锁 glm-5.3，得到 %+v", st.RateLimitedModels)
+	}
+	firstUntil := st.RateLimitedModels[0].Until
+
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "glm-5.3", "6004 model rate limit (reset unknown)")
+	st2, _ := p.Status("u1")
+	if len(st2.RateLimitedModels) != 1 {
+		t.Fatalf("重复命中不得开辟新条目: %+v", st2.RateLimitedModels)
+	}
+	if d := st2.RateLimitedModels[0].Until.Sub(firstUntil); d < -time.Second || d > time.Second {
+		t.Errorf("冷却中重复命中不得延长期限（%v → %v）", firstUntil, st2.RateLimitedModels[0].Until)
 	}
 }
 

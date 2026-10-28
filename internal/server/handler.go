@@ -945,6 +945,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// modelBusyWaited 14003 短等待只允许发生一次（见 acct==nil 分支）。
+	modelBusyWaited := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1142,6 +1144,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// rotate 是轮转循环的标签：循环体内**嵌套 switch**（如网关 401 的求证分支）
+	// 里的 break 只跳出 switch，用裸 break 终止轮转会静默落回循环外的收尾路径，
+	// 把同一次失败按第二个错误类别再罚一遍（含 ErrSessionDead → Disable）。
+rotate:
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -1165,8 +1171,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
 			//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
-			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
-			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			// 判定必须与选号同口径（按 realm）：跨域统计会让另一域的健康号掩盖
+			// 本域「全被该模型挡住」，报错方向就指错了（issue #102 附带发现 1）。
+			modelBlock = h.cfg.Pool.ModelBlockedForRealm(realm, bareModel)
+			// 14003「模型繁忙」是间歇性的短窗（10s~1m）。本域全被一个**很快**就解封
+			// 的短窗挡着时，等它一下再选一次，比直接报「没有可用账号」更贴近上游事实。
+			// 上限 maxModelBusyWait、只等一次、ctx 可取消——绝不把请求挂成长期等待；
+			// 超过上限就直接报错，让客户端用它自己的退避策略。
+			if !modelBusyWaited && modelBlock.Blocked && modelBlockIsTransient(modelBlock.Reason) {
+				if wait := time.Until(modelBlock.Until); wait > 0 && wait <= maxModelBusyWait {
+					modelBusyWaited = true
+					if !sleepCtx(r.Context(), wait) {
+						break // 客户端已断连，等待无意义
+					}
+					continue
+				}
+			}
 			break
 		}
 		st.uid = acct.UID
@@ -1191,10 +1211,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-				lastErr = err
-				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+			rerr := h.cfg.Upstream.RefreshToken(acct)
+			// RT 失效但 AT 仍有效：这号此刻 chat 仍然通，只是换不出新 token。
+			// 直接禁号等于用「续期失败」给一个健康号判死刑——verify.go 的唯一稳定
+			// 判据是 AT 还能不能用，故容忍这一次、用现有 AT 走完这一跳。
+			toleratedDeadRT := false
+			if rerr != nil && isSessionDeadError(rerr) && upstream.SessionDeadButUsable(acct) {
+				toleratedDeadRT = true
+				log.Printf("WARN: [server] chat acct=%s: RT 已失效但 AT 仍可用（至 %s）— 用现有 AT 继续",
+					logfmt.Label(acct.UID, acct.Nickname),
+					time.Unix(acct.ExpiresAtValue(), 0).Format(time.RFC3339))
+			}
+			if rerr != nil && !toleratedDeadRT {
+				lastErr = rerr
+				if isSessionDeadError(rerr) {
 					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
@@ -1205,9 +1235,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			if err := acct.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+			if rerr == nil {
+				if err := acct.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
+					log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+				}
 			}
 		}
 
@@ -1286,7 +1318,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 							logfmt.Label(acct.UID, ""))
 						fail(acct.UID)
 						if !rotateBackoff(i, r.Context()) {
-							break
+							break rotate
 						}
 						continue
 					case upstream.VerifyInconclusive:
@@ -1297,11 +1329,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 							logfmt.Label(acct.UID, ""))
 						fail(acct.UID)
 						if !rotateBackoff(i, r.Context()) {
-							break
+							break rotate
+						}
+						continue
+					case upstream.VerifyDead:
+						// refresh 被应用层明确拒绝 → 登录态确实失效。仍**不立即禁用**：
+						// 网关 401 在风控窗口里会成串出现，单次求证失败就把号永久踢出，
+						// 等于让一次边缘风控升级成人工重登。与保活同一口径——连续
+						// sessionDeadThreshold 次才禁用，任何一次成功都会清零。
+						if h.cfg.Pool.NoteSessionDead(acct.UID) {
+							log.Printf("WARN: [server] 账号 %s 网关 401 且 refresh 判死，连续 %d 次 — 禁用",
+								logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
+						} else {
+							log.Printf("INFO: [server] 账号 %s 网关 401 且 refresh 判死（未达 %d 次阈值，换号继续）",
+								logfmt.Label(acct.UID, acct.Nickname), pool.SessionDeadThreshold())
+						}
+						lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+						fail(acct.UID)
+						if !rotateBackoff(i, r.Context()) {
+							break rotate
 						}
 						continue
 					}
-					// VerifyDead：refresh 被应用层明确拒绝 → 落到下方 session dead 处置。
 				}
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
@@ -1823,6 +1872,11 @@ func modelBlockIsTransient(reason string) bool {
 	return false
 }
 
+// maxModelBusyWait 14003 瞬时阻塞的等待上限。超过这个时长就直报错：一个 HTTP 请求
+// 被挂成分钟级等待，比「稍后重试」更伤客户端；长等待交给客户端自己的退避策略。
+// 等待本身复用 backoff.go 的 sleepCtx（唯一实现，ctx 取消即返回）。
+const maxModelBusyWait = 5 * time.Second
+
 // writeModelQuotaError 用「上游业务码」形态回 429。
 //
 // code 为数字（6004/6000）而不是字符串：上游自己就是这样回的，客户端解析「额度
@@ -1989,20 +2043,36 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 14003「当前模型请求繁忙」：瞬时抖动，走独立短窗（10s 起、封顶 1m），
 		// 不套 soft_rate 的 600s→2h 阶梯——套上去会把一次抖动放大成整池十分钟不可用。
 		// 必须判在 IsModelRateLimit 之前：14003 也在模型级限流码集合里。
+		// 上游给了 Retry-After 时采信它（仍钳到 1m：边缘/WAF 也会塞这个头）。
 		if upstream.IsModelBusy(body) {
-			h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
+			var wait time.Duration
+			if uerr != nil && uerr.RetryAfter > 0 {
+				wait = uerr.RetryAfter
+			}
+			h.cfg.Pool.CooldownModelBusyWithWait(uid, model, "14003 model busy", wait)
 			return
 		}
-		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		// 6004 是**模型级**信号：只要 body 明确指向模型限流，作用域就只停
+		// (账号, 模型)，同号切模型立即可用。有没有上游重置时间只影响「停到什么时候」，
+		// 不改变「停哪个作用域」——旧实现在无重置文案时退化成账号级冷却，
+		// 让一次单模型限流连坐整号，切模型也救不回来。
+		// 无模型名（model==""）无法归属，回落账号级（见 CooldownSoftForModel 的说明）。
 		modelRateLimited := upstream.IsModelRateLimit(body)
-		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			if modelRateLimited {
+		if modelRateLimited && model != "" {
+			if resetAt, ok := upstream.ParseRateReset(body); ok {
+				// 上游墙钟是唯一权威恢复时刻：不截短到 soft_rate_max。
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
+			if uerr != nil && uerr.RetryAfter > 0 {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), model, "6004 model rate limit (retry-after)")
+				return
+			}
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), time.Time{}, model, "6004 model rate limit (reset unknown)")
+			return
+		}
+		// 账号级限流（11140 rate-limiting 等非 6004 形态）：账号级冷却，不产生模型豁免。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}
@@ -2010,18 +2080,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
-			if modelRateLimited {
-				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-			}
 			return
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
-		if modelRateLimited {
-			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-		}
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
@@ -2109,6 +2173,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// isSessionDeadError 报告 err 是否为上游明确判死的登录态失效（12153 session dead）。
+// 只认类型化信封的 Kind，不做 err.Error() 文本匹配（见 backend/error-handling.md）。
+func isSessionDeadError(err error) bool {
+	var ue *upstream.Error
+	return errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

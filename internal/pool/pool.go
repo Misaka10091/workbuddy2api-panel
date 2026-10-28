@@ -357,7 +357,8 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		}
 	}
 	if changed {
-		p.saveLocked()
+		p.dirty.Store(true)
+		p.flushLocked()
 	}
 }
 
@@ -373,7 +374,7 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	}
 	delete(p.byUID, uid)
 	p.dirty.Store(true)
-	p.saveLocked()
+	p.flushLocked()
 	return e.a
 }
 

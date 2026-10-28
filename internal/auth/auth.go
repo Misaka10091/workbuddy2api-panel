@@ -92,6 +92,17 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// ExpiresAtValue 加锁读取 ExpiresAt（Unix 秒；同 AccessTokenValue：RefreshToken 在
+// 锁内改写它）。日志/面板要展示到期时刻时经此取值，勿直读字段。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // TokenSource 解出 access token JWT 里的 token_source 声明（= 官方客户端的
 // X-Auth-Method 取值）。非 JWT / 无该声明 → ""。
 //
@@ -260,6 +271,25 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	return time.Now().Add(within).Unix() >= a.ExpiresAt
 }
 
+// expiresAtMillisThreshold 判定「毫秒时间戳」的阈值：1e11 秒 ≈ 5138 年，
+// 任何真实的秒级过期时间都远小于它，超过就只可能是毫秒（或更细）时间戳。
+const expiresAtMillisThreshold = 100_000_000_000
+
+// normalizeExpiresAt 把凭证里的 expiresAt 归一到 Unix 秒。
+//
+// 插件导出与手写文件都可能给毫秒时间戳（13 位）。直接当秒用会被解释成极远未来：
+// NeedsRefresh 永假 → token 永不刷新 → 真过期后账号直接不可用，且全程没有任何报错，
+// 只能靠"突然全 401"倒推。对合法秒值幂等（小于阈值原样返回），写回仍为秒。
+func normalizeExpiresAt(v int64) int64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > expiresAtMillisThreshold {
+		return v / 1000
+	}
+	return v
+}
+
 // Parse 兼容两种磁盘形态：
 //
 //	嵌套形 {"auth":{...},"account":{...}}  （插件 OAuth 输出）
@@ -296,7 +326,7 @@ func Parse(raw []byte) (*Auth, error) {
 		a = Auth{
 			AccessToken:  n.Auth.AccessToken,
 			RefreshToken: n.Auth.RefreshToken,
-			ExpiresAt:    n.Auth.ExpiresAt,
+			ExpiresAt:    normalizeExpiresAt(n.Auth.ExpiresAt),
 			Domain:       n.Auth.Domain,
 			realm:        n.Auth.Realm,
 			UID:          n.Account.UID,
@@ -322,7 +352,7 @@ func Parse(raw []byte) (*Auth, error) {
 		a = Auth{
 			AccessToken:  f.AccessToken,
 			RefreshToken: f.RefreshToken,
-			ExpiresAt:    f.ExpiresAt,
+			ExpiresAt:    normalizeExpiresAt(f.ExpiresAt),
 			Domain:       f.Domain,
 			realm:        f.Realm,
 			UID:          f.UID,
@@ -372,8 +402,42 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	return saveFileAtomicRetry(a.FilePath, raw)
+}
+
+// saveAttempts 凭据落盘的重试次数。
+//
+// 刷新成功后只调一次 SaveAtomic：写失败就等于把**旧 RT** 留在磁盘上，重启后拿它去
+// 刷新会真的失效（上游已轮换）。文件系统抖动（杀进程、网络盘短暂不可写、Windows
+// 上目标文件被杀软临时占用）重试一次就能救回来，代价只有几十毫秒。
+const saveAttempts = 3
+
+// saveRetryDelay 重试间隔的基数（第 n 次重试等 base<<(n-1)）。全程持 a.mu，
+// 取小值避免长时间独占凭证锁。
+const saveRetryDelay = 20 * time.Millisecond
+
+// saveFileAtomicRetry 有界重试的原子写：写临时文件 → fsync → rename。
+func saveFileAtomicRetry(path string, raw []byte) error {
+	var lastErr error
+	for attempt := 0; attempt < saveAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(saveRetryDelay << uint(attempt-1))
+		}
+		if err := saveFileAtomic(path, raw); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// saveFileAtomic 单次原子写。fsync 不可省：只 rename 不刷盘时，掉电后可能留下
+// 一个长度正确、内容为空的凭证文件——那比写失败更糟，因为它看起来是有效的。
+func saveFileAtomic(path string, raw []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
 		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
@@ -385,7 +449,18 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
