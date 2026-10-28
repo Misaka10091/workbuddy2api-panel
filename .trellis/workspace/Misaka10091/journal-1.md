@@ -50,3 +50,26 @@ P1 频控 / P2 状态落盘 / P3 观测与暴露面四组移植，48 文件、+2
 
 **遗留**：`X-API-Key` 双头与 images/search 白名单在本地不适用；CN 对话主域改
 `www.workbuddy.cn`（上游 `741cf59`）涉及路由变更，待单独决策。
+
+
+## Session 1: 同步上游第二轮风控修复（误禁保护/模型级限流/可靠落盘）
+<!-- trellis-session: v=2 fp=89810f5939497478 -->
+
+**Date**: 2026-10-28
+**Task**: 同步上游第二轮风控修复（误禁保护/模型级限流/可靠落盘）
+**Branch**: `sync/upstream-risk-r2`
+
+### Summary
+
+按上游 5367e78 修三组缺陷：刷新单飞此前不发布 call.res，失败被等待者读成成功；保活/预刷新未接入 SessionDeadButUsable，RT 死但 AT 有效也会被判死；网关 401 求证里裸 break 只跳出 switch，ctx 取消会二次罚号（VerifyAlive 误禁刚刷新成功的号）。6004 作用域统一到 (账号,模型) 且模型重置时间不再被 soft_rate_max 截短；14003 采信 Retry-After；全池阻塞判定改按 realm。落盘改为写成功才清 dirty，加 fsync/.bak/.corrupt 恢复与凭据保存重试，budget 热生效。三项与本地 spec 冲突，经确认按上游改并同步更新 error-handling/pool-lifecycle/config-and-hot-reload。build/vet/test 全绿。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7479b5e` | fix(upstream,pool,server): 刷新单飞发布结果、误禁保护与模型级限流作用域 |
+| `d3027c9` | chore(trellis): 记录 10-27 风控二轮任务的分支与状态 |
+
+### Status
+
+[OK] **Completed**
