@@ -12,7 +12,7 @@
   "assignee": "Misaka10091",
   "createdAt": "2026-10-27",
   "completedAt": null,
-  "branch": "main",
+  "branch": "sync/upstream-risk-r2",
   "base_branch": "main",
   "worktree_path": null,
   "commit": null,
