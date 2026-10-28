@@ -1082,18 +1082,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
 	//     （客户端项目规范/工具约定与网关提示词并用，issue #129）。
-	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
+	//   - passthrough + 降级期：按「拆句 → 搬家 → 替换」三级出站（与下面重试阶梯同序），
+	//     拆不动自然掉到下一层，不再先撞 400。
 	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
-	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
-	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带指纹原文重试
+	// 是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// splitApplied / movedApplied：11-128 的两层「不改文本」抢救各用一次（拆句留在 system、
+	// 搬家进 user），与 degradedApplied（中性提示词替换）按顺序各用一次，避免同一请求反复重试。
+	splitApplied := false
+	movedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
 		body = prompt.Append(body, h.cfg.PromptText)
 	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
-		body = prompt.Rewrite(body, prompt.Degraded)
-		degradedApplied = true
+		// 降级期：与重试阶梯同一优先级——拆句留在 system 最好，其次搬家，都不行才整体替换。
+		// degradeGate 只有「窗口」语义、没有层级状态，故每次请求重跑本链（不新增持久化层级）。
+		if split, ok := prompt.SplitSystemMessages(body); ok {
+			body = split
+			splitApplied = true
+		} else if moved, ok := prompt.MoveSystemToUser(body, prompt.Degraded); ok {
+			body = moved
+			movedApplied = true
+		} else {
+			body = prompt.Rewrite(body, prompt.Degraded)
+			degradedApplied = true
+		}
 	}
 	// 渠道校验兜底：上游要求 messages[0] 必须是 system（首条 user 直接 400 11-128
 	//「first message is not system prompt」，首条 developer 报 unapproved channel）。
@@ -1358,18 +1373,54 @@ rotate:
 					}
 				}
 			}
-			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
-			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
+			// 内容拦截误报（passthrough/append 模式）：三层抢救，从「改动最小」到
+			// 「改动最大」，任一层成功即置降级态、同请求内重试一次。
+			//   ① SplitSystemMessages：按句界把 system 拆成多条，**仍在 system 里**，文本
+			//      一字不改（实测原段 400 / 拆开后 200，见 prompt.SplitSystemMessages 注释）；
+			//   ② MoveSystemToUser：拆不动（单句 system）时把原文搬进首条 user；
+			//   ③ Rewrite(Degraded)：中性提示词整体替换，保证不再命中（append 降级重试同样
+			//      退化为 replace——原文在场只会确定性再撞 400）。
+			// **抢救不占换号名额**（下面三处 `i--`）：抢救是同一请求换承载形态、不是换号，
+			// 而 MaxRotate 的语义是「换几个号」。若把名额花在抢救上，三次都被拦的请求会
+			// 在循环里耗尽轮转、落到末端 503 no_healthy_account，把「400 content_blocked
+			// + 上游原文」这个可排查语义弄丢（实测回归）。抢救次数由三个 applied 标志
+			// 限死为 3，不会无限循环。
+			// 三轮之后仍被拦（用户内容本身触发审核）→ 环内终态分支回内容防火墙错误。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !splitApplied {
+				if split, ok := prompt.SplitSystemMessages(body); ok {
+					body = split
+					splitApplied = true
+					// 置降级态：这条客户端的 system 每次都会被拦，逐请求重试等于双倍上游调用。
+					// 之后的新请求直接按拆分形态出站，文本不丢也不再撞墙。
+					h.degrade.Trigger()
+					delete(tried, acct.UID) // 让同一账号拿到本次重试名额（单账号池也能重试）
+					releaseHeld()
+					log.Printf("content-blocked (system fingerprint) -> split system into sentences, retry")
+					i-- // 抢救不占换号名额（见上）
+					continue
+				}
+			}
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !movedApplied {
+				if moved, ok := prompt.MoveSystemToUser(body, prompt.Degraded); ok {
+					body = moved
+					movedApplied = true
+					h.degrade.Trigger()
+					delete(tried, acct.UID) // 让同一账号拿到本次重试名额
+					releaseHeld()
+					log.Printf("content-blocked (system fingerprint) -> moved system text into first user message, retry")
+					i-- // 抢救不占换号名额（见上）
+					continue
+				}
+			}
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
-				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				delete(tried, acct.UID) // 让同一账号拿到本次重试名额
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				i-- // 抢救不占换号名额（见上）
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {

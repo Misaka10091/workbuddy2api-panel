@@ -20,6 +20,7 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	"Tokens prefixed with @",                          // DSH 0.3.x 的 @ 路径说明段（唯一不含品牌词的 DSH 指纹）
 }
 
 // sanitizeIdentityFeatures 身份类特征：品牌词（DSH 身份句）。默认对所有消息角色生效
@@ -44,6 +45,72 @@ var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
 
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
 var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+
+// sanitizeDshPathsProbe / sanitizeDshPathsRe / sanitizeDshPathsReplacement
+// DSH 0.3.x system prompt 里的 @ 路径说明段改写（11-128 抢救，上游 db31fc2 + 4f79fc8）。
+//
+// 这一段是**唯一不含品牌词**的 DSH 指纹：身份类规则（DeepSeekRuntime）的预检根本不
+// 会命中，原有字面量特征也一条都对不上，于是原文原样出站 → 400 11-128 Illegal API
+// invocation from an unapproved channel。上游按「连续原文」匹配（逐段二分实测：只发
+// 首句放行，前两句连排即拦），所以必须整段一起改。
+//
+// 两种线上措辞都要覆盖（(?s) 让 .*? 跨行，段内本来就有换行）：0.3.x 当前的
+// `... quotes a path containing spaces.` 与更早的 `... form only quotes a path that
+// contains spaces.`（见 research §1.2/§0 结论 2）。正则靠 `.*?` 吞掉中间、靠尾部双分支
+// 吃下两种结尾，因此一条正则覆盖两种；上游 sanitize_test.go 里 dshPathsNow/Old 两个夹具
+// 常量的命名与实际新旧恰好相反，别按名字推断版本。
+//
+// 两条已知边界：预检是大小写敏感的（与 sanitizeFeatures 其它项一致；DSH 原文大小写
+// 固定）；规则属于全局改写层，任何角色里出现这一段都会被改——上游按连续原文匹配、
+// 不分角色，保留原样必然 400。
+const sanitizeDshPathsProbe = "Tokens prefixed with @"
+
+var sanitizeDshPathsRe = regexp.MustCompile(
+	`(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?path (?:containing|that contains) spaces\.`)
+
+// sanitizeDshPathsReplacement 做同义改写而不是删除：@ 路径、相对路径基准、结尾斜杠
+// 表示目录、其余按文件读、@"..." 用于含空格的路径——语义全部保留，只换措辞让连续
+// 特征失配。
+//
+// 一处偏离：原文用 "workspace root"，这里写 "project root"。hub #677/#678 的整段
+// 回放结论称改整段即 200、workspace root 保留没问题；ithtelab/workbuddy-manager#312
+// 的 0032 则称上游又单独拉黑了 workspace root（root→base 即放行）——两种说法下
+// project root 都安全，且与 DSH 语义等价（相对路径基准），故取它。
+const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the user explicitly mentioned. " +
+	"Relative paths are resolved against the project root; absolute paths point " +
+	"to files or directories on the host. A trailing slash marks a directory, so " +
+	"list it when its contents matter. Anything else is a file: open it with the " +
+	"read tool when its contents are needed, and never claim to have inspected it " +
+	"before reading. The @\"...\" form only quotes a path that contains spaces."
+
+// sanitizeIdentitySentenceRe 身份句式整句中性化（11-128 抢救，上游 4f79fc8）。
+//
+// 只换品牌词而保留 "You are … powered by X." 的骨架仍会被拦——上游认的是句式，
+// 故整句换成中性句（输出与 prompt.Degraded 同义：不改变用户指令的合法性语义）。
+//
+// 结尾用捕获组 (\s|$) 回填，而不是零宽断言：Go 的 RE2 不支持 (?=)，句尾那个空白必须
+// 原样接回去——否则 "…assistant. Use the read tool" 会被粘成 "assistant.Use the read tool"。
+// shortcut: 句子必须以句号收尾才匹配（观测到的指纹都带句号），无句号的变体放行。
+//
+// 窗口有界（修饰词 0~3 个、名词可省）——"You are free to use tools built by …" 这类
+// 分词修饰宾语的句子不该被误伤，靠的就是这个上界。{0,3}? 是懒量词：先试 0 个修饰词、
+// 不匹配再逐步放宽（配合后面的可选名词与动词表）。[\w.-]+ 允许带点/连字符的专名
+// （deepseek-v4.1-flash、AcmeRuntime）。七种动词搭配一次列全：上游补一条新搭配就能
+// 让只认单个动词的实现重新 400。
+var sanitizeIdentitySentenceRe = regexp.MustCompile(
+	`(?i)You are\s+` +
+		`(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?` +
+		`(?:agent|assistant|model|AI|LLM)?[\s,]*` +
+		`(?:powered by|built on|built by|created by|developed by|made by|trained by)` +
+		`[^\n]*?\.(\s|$)`)
+
+const sanitizeIdentitySentenceReplacement = "You are a helpful AI assistant.${1}"
+
+// sanitizeIdentityVerbs 与 sanitizeIdentitySentenceRe 的动词表逐项对应（同一张表两处
+// 维护）：hasIdentityFingerprint 先用它做 ToLower + Contains 快路，命中后再交正则确认。
+var sanitizeIdentityVerbs = []string{
+	"powered by", "built on", "built by", "created by", "developed by", "made by", "trained by",
+}
 
 // sanitizeRewrites 改写层：全模板句逐字替换（每句只改一个词，语义不变）。
 //
@@ -117,9 +184,16 @@ func sanitizeTextWith(text string, brand bool) string {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
 	if brand {
+		// 身份句式先于品牌词：正则要匹配原文里的品牌全名，先换品牌会让规则失配。
+		text = sanitizeIdentitySentenceRe.ReplaceAllString(text, sanitizeIdentitySentenceReplacement)
 		for _, rw := range sanitizeIdentityRewrites {
 			text = strings.ReplaceAll(text, rw[0], rw[1])
 		}
+	}
+	// @ 路径说明段：预检已是字面量，这里再挡一次，避免无关文本白跑一遍跨行正则。
+	// 不在 if brand 内——上游按连续原文匹配、不分角色，任何角色里的原文都会 400。
+	if strings.Contains(text, sanitizeDshPathsProbe) {
+		text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsReplacement)
 	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
@@ -150,12 +224,22 @@ func hasFingerprint(text string) bool {
 	return sanitizeBareHdrRe.MatchString(text)
 }
 
-// hasIdentityFingerprint 身份类特征（品牌词）预检；只在需要应用身份类规则时调用，
-// 保证 brand=false 的路径不会因为只含品牌词而进入清洗（否则末尾 TrimSpace 会裁掉用户空白）。
+// hasIdentityFingerprint 身份类特征（品牌词 / 身份句式）预检；只在需要应用身份类规则时
+// 调用，保证 brand=false 的路径不会因为只含品牌词而进入清洗（否则末尾 TrimSpace 会裁掉
+// 用户空白）。
+//
+// 身份句式先走动词字面量探测（纯 C 单遍扫描），命中才交给正则确认——正则确认是必需的：
+// 只按 "powered by" 这类词判真会把「讲解某产品」的普通用户消息也拖进清洗。
 func hasIdentityFingerprint(text string) bool {
 	for _, f := range sanitizeIdentityFeatures {
 		if strings.Contains(text, f) {
 			return true
+		}
+	}
+	low := strings.ToLower(text)
+	for _, v := range sanitizeIdentityVerbs {
+		if strings.Contains(low, v) {
+			return sanitizeIdentitySentenceRe.MatchString(text)
 		}
 	}
 	return false

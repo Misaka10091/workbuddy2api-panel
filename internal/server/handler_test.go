@@ -1354,9 +1354,19 @@ func TestStatusRequiresAuth(t *testing.T) {
 }
 
 // TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+// → 同请求内抢救 → 200，客户端无感。
+//
+// 语义反转（同步上游 e4dd458 的三级抢救）：此用例的客户端 system 是**单句**
+// （"原始指纹"，无句末标点）→ SplitSystemMessages 切不出 ≥2 段 → 掉到第二层
+// MoveSystemToUser：原文搬进首条 user 消息前部、system 换成 Degraded 中性提示词。
+// 因此断言从旧的「第二次 body 不含原始 system」反转为：
+//   - 第二次出站的 messages[0] 是 Degraded（system 通道被中性化）；
+//   - 原始文本**仍在** body 里（搬到首条 user 前部，sysText+"\n\n"+txt），一个字不丢。
+//
+// 旧断言（`!contains 原始指纹`）只对第三层 Rewrite 成立，对第二层是错的——它把
+// 「搬家」误读成「丢弃」。
 func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
-	// 记录每次出站请求体，断言第二次为 Degraded 文本。
+	// 记录每次出站请求体，断言第二次为「system 中性化 + 原文搬进 user」。
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1386,17 +1396,115 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
+		t.Fatalf("code=%d body=%s (want 200 after rescue retry)", rec.Code, rec.Body)
 	}
 	if len(bodies) != 2 {
 		t.Fatalf("want 2 upstream calls (first 400 + retry), got %d", len(bodies))
 	}
-	// 第二次出站 body 的 messages 头部 system 内容应为 Degraded 文本。
-	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
-		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
+	var out struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
 	}
-	if strings.Contains(string(bodies[1]), "原始指纹") {
-		t.Errorf("second body should not contain original system: %s", bodies[1])
+	if err := json.Unmarshal(bodies[1], &out); err != nil {
+		t.Fatalf("second body not json: %v (%s)", err, bodies[1])
+	}
+	if len(out.Messages) < 2 {
+		t.Fatalf("second body messages=%d want >=2 (%s)", len(out.Messages), bodies[1])
+	}
+	// 首条仍是 system（渠道校验要求），内容换成 Degraded。
+	if out.Messages[0].Role != "system" || out.Messages[0].Content != prompt.Degraded {
+		t.Errorf("second body messages[0] 应为 Degraded system: role=%q content=%q",
+			out.Messages[0].Role, out.Messages[0].Content)
+	}
+	// 原文搬到首条 user 前部：sysText + "\n\n" + txt。
+	if want := "原始指纹\n\nhi"; out.Messages[1].Content != want {
+		t.Errorf("首条 user 应携带搬入的原文 (%q)，得到 %q", want, out.Messages[1].Content)
+	}
+}
+
+// TestContentBlockedSplitSystemFirst 撞 400 后的抢救**顺序**断言：先拆句，不是先搬家
+// 也不是先整体替换（来源：上游 e4dd458 重排 + 真机 A–G 对照，research §4.3/§4.4）。
+//
+// 守护的语义：
+//   - 多句 system → SplitSystemMessages 成功 → 第二次出站是**多条 system**、文本一字不改、
+//     user 消息还是原文（既没被搬家、也没被 Degraded 替换）；
+//   - 一次就够（2 次上游调用）——拆分成功后不该再叠加搬家/替换。
+//
+// 与 TestContentBlockedTriggersDegradedRetry（单句 → 掉到搬基层）配对，两条一起钉住
+// 「拆不动才往下掉」的阶梯方向。
+func TestContentBlockedSplitSystemFirst(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[`+
+			`{"role":"system","content":"First instruction sentence. Second instruction sentence."},`+
+			`{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after split retry)", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (first 400 + split retry), got %d", len(bodies))
+	}
+	var out struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[1], &out); err != nil {
+		t.Fatalf("second body not json: %v (%s)", err, bodies[1])
+	}
+	// 2 条 system + 1 条 user：拆句没有新增/删除消息之外的东西。
+	if len(out.Messages) != 3 {
+		t.Fatalf("second body messages=%d want 3 (2 system + 1 user): %s", len(out.Messages), bodies[1])
+	}
+	if out.Messages[0].Role != "system" || out.Messages[0].Content != "First instruction sentence." {
+		t.Errorf("messages[0] 应为第一句 system 原文: role=%q content=%q",
+			out.Messages[0].Role, out.Messages[0].Content)
+	}
+	if out.Messages[1].Role != "system" || out.Messages[1].Content != "Second instruction sentence." {
+		t.Errorf("messages[1] 应为第二句 system 原文: role=%q content=%q",
+			out.Messages[1].Role, out.Messages[1].Content)
+	}
+	// user 消息一字不动 → 证明这一层没有走搬家。
+	if out.Messages[2].Role != "user" || out.Messages[2].Content != "hi" {
+		t.Errorf("user 消息应原样保留（未被搬家/替换）: role=%q content=%q",
+			out.Messages[2].Role, out.Messages[2].Content)
+	}
+	// 没有任何 system 被换成 Degraded → 证明这一层没有走整体替换。
+	for i, m := range out.Messages {
+		if m.Role == "system" && m.Content == prompt.Degraded {
+			t.Errorf("messages[%d] 是 Degraded → 走了第三层而非拆句: %s", i, bodies[1])
+		}
+	}
+	// 拆句成功后同样置降级态：后续请求按拆分形态出站，不再先撞 400。
+	if !h.degrade.Active() {
+		t.Error("split 抢救成功后应置降级态（degrade.Trigger）")
 	}
 }
 
@@ -1469,7 +1577,13 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	}
 }
 
-// TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
+// TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError），
+// **且**三轮抢救耗尽后回到环内的 400 content_blocked 终态。
+//
+// 后一条断言（status=400）是 2026-10-28 修「抢救占换号名额」时补的：抢救层 `i--` 之前，
+// 本例（无 system → EnsureSystemFirst 补 Degraded 多句）会连吃三层抢救、耗尽 MaxRotate，
+// 落到末端 503 no_healthy_account；现在抢救不占名额，终态分支可达。
+// 但「不罚号」才是本用例的原始职责，两者分开断言，别互相掩盖。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1483,9 +1597,74 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("三轮抢救后应回 400 content_blocked，得到 %d: %s", rec.Code, rec.Body)
+	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
 		t.Fatalf("ErrContentBlocked should not penalize account: %+v", st)
+	}
+}
+
+// TestContentBlockedAfterAllRescuesReturns400 三轮抢救都被拦时，必须回到**环内**的
+// 内容防火墙终态：400 + code=content_blocked + 上游 body 原文透传，且不罚号。
+//
+// 守护的语义（2026-10-28 裁决，本仓口径而非上游口径）：MaxRotate 是「换几个号」，
+// 抢救是同一请求换承载形态、不是换号，故三处抢救 `continue` 前要 `i--`，不得消耗
+// 轮转预算。去掉 `i--` 时本用例会红在「calls=3 / status=503 no_healthy_account」——
+// 那正是把「内容被审核」误报成「全池无可用账号」的可观测回归。
+//
+// 期望调用次数 = 4：1 次原始 + 拆句 + 搬家 + 替换各一次（三次抢救后第 4 次才进终态）。
+func TestContentBlockedAfterAllRescuesReturns400(t *testing.T) {
+	var calls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: 400,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":11128,"msg":"blocked by security policy"}`)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 熔断阈值 1：任何一次误罚 NoteError 都会立刻熔断，断言即红。
+	p.SetBreaker(1, time.Hour, time.Hour)
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	// 多句 system：保证第一层「拆句」确实生效（单句会直接掉到搬基层，测不到三层）。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[`+
+			`{"role":"system","content":"First instruction sentence. Second instruction sentence."},`+
+			`{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 content_blocked: %s", rec.Code, rec.Body)
+	}
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if env.Error.Code != "content_blocked" {
+		t.Errorf("error.code=%q want content_blocked（不得退化成 no_healthy_account）", env.Error.Code)
+	}
+	// error-passthrough：message 装上游 body 原文，客户端才能拿去排查/反馈。
+	if !strings.Contains(env.Error.Message, "11128") {
+		t.Errorf("message 应透传上游原文: %q", env.Error.Message)
+	}
+	if calls != 4 {
+		t.Errorf("上游调用次数=%d want 4（1 原始 + 3 层抢救各一次）", calls)
+	}
+	st, _ := p.Status("u1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("内容拦截不得罚号: %+v", st)
 	}
 }
 
