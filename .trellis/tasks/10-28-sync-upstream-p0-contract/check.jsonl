@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "前置清单、质量门与十条最容易违反的硬约定、禁止清单；检查时要逐条对照分层与硬约定"}
+{"file": ".trellis/spec/backend/quality-and-testing.md", "reason": "验收时核对测试形状、确定性、冻结断言与 go build/vet/test 三门；并检查是否出现改容差/删断言的假绿"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 6020/6021 新语义是否仍满足不罚号、message 不替换，以及分类顺序未被改动"}
+{"file": ".trellis/spec/backend/upstream-protocol.md", "reason": "核对出站头族、payload 步骤顺序、脱敏作用域是否被改动，以及该 spec 是否需在本轮同步更新"}
+{"file": ".trellis/spec/collaboration/git-workflow.md", "reason": "核对分支名、commit 格式与署名、提交范围是否夹带运行产物或 auths/"}
+{"file": ".trellis/tasks/10-28-sync-upstream-p0-contract/prd.md", "reason": "逐条对照验收标准 1-7，缺项不许过门"}
+{"file": ".trellis/tasks/10-28-sync-upstream-p0-contract/design.md", "reason": "核对实现是否与十项裁决一致（尤其 billing X-Request-ID 不外溢、prompt_cache_key 保持 v4、busy 路径不做）"}
