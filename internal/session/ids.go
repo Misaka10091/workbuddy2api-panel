@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -69,6 +70,39 @@ func NewConversationID() string {
 	u[6] = (u[6] & 0x0f) | 0x40 // version 4
 	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+// NewTimeOrderedID 生成时间有序 ID：UUID v7 带横线（36 字符）。
+//
+// 为什么另开一个生成器（上游 47f1ed6）：WorkBuddy 5.9.3 真机的会话级 ID 已从 v4
+// 换成 v7——抓包样本 `01a1815d-dacf-75f1-8919-7f596025b9b3` 前 48 bit 解出
+// 1793171774159 ms（毫秒时间），第 13 位恒 7。v4 与 v7 在第 13 位就直接可分，
+// 所以「会话 ID / acp-connection-id」这类客户端自己生成的标识必须换成 v7。
+//
+// 使用边界：**只给网关自己生成的会话级标识**用（X-Conversation-ID 的零值兜底、
+// acp-connection-id 的零值兜底）。prompt_cache_key 仍走 v4（`upstream.buildCacheKey`），
+// 那是与上游前缀缓存槽绑定的值，改版本会让存量会话的缓存槽整体漂移一次。
+//
+// 熵源故障时用时间位重复填充在剩余字节上兜底——形态退让（仍是合法 v7 形态的骨架），
+// 但绝不 panic、绝不空串。
+func NewTimeOrderedID() string {
+	var b [16]byte
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		// 熵源故障的极端兜底：不 panic、不空串（仍保证 v7 变体位）。
+		for i := 6; i < 16; i++ {
+			b[i] = byte(ms >> uint((i%6)*8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x70 // version 7
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // NewTraceID 生成链路 trace ID：32 hex，**纯随机、不带时间位**。

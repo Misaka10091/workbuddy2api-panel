@@ -223,15 +223,27 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			e.degradeUntil = *s.DegradeUntil
 		}
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
+		//
+		// 11102/11158 存量条目还要按当前 modelBlockMaxTTL **钳制**：升级前写入的
+		// Until 可能是 now+6h（旧基数 6h / 旧封顶 24h），不钳就得等自然到期才看到
+		// 新 TTL —— 而收窄 TTL 的目的正是让「11102 误判」快速自愈（旧参数把一次
+		// 偶发误判放大成 (账号,模型) 锁死 6h，多号轮一圈就是整池该模型 503）。
+		// 只钳确定性负缓存；6004 的 Until 是上游权威重置墙钟，钳它等于提前放行
+		// 一个仍然超额度的号，不碰。
 		if len(s.ModelCooldowns) > 0 {
+			maxUntil := now.Add(modelBlockMaxTTL)
 			for m, mc := range s.ModelCooldowns {
 				if mc.Until.IsZero() || !now.Before(mc.Until) {
 					continue
 				}
+				until := mc.Until
+				if modelBlockBackoffReason(mc.Reason) && until.After(maxUntil) {
+					until = maxUntil
+				}
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				e.modelCooldowns[m] = modelCooldown{Until: until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目

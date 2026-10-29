@@ -179,3 +179,29 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 		t.Errorf("Count=%d want 1（暂停号不计入）", st.Count)
 	}
 }
+
+// TestModelBlockTTLShortEnoughToSelfHeal 11102 负缓存必须短到能自愈。
+//
+// 原参数 6h 起、封顶 24h，把一次偶发误判（11102 不总是「这号真没这模型」——路径级
+// 差异、上游瞬时抖动、分类误判都会吐同一个码）放大成 (账号,模型) 锁死整天，多号轮
+// 一圈就是整池该模型 503（ithtelab/workbuddy-manager#312 的 0033 / issue #308：实测
+// 同一账号两分钟就恢复）。退避本身保留，只是基数与封顶缩短。
+//
+// 断言用**区间**而不是等值：将来微调（如 3m/12m）不该红，只有回到小时级才必须红。
+func TestModelBlockTTLShortEnoughToSelfHeal(t *testing.T) {
+	if modelBlockBaseTTL > 5*time.Minute {
+		t.Fatalf("modelBlockBaseTTL=%v 过长：一次误判会把 (账号,模型) 锁太久", modelBlockBaseTTL)
+	}
+	if modelBlockMaxTTL > 15*time.Minute {
+		t.Fatalf("modelBlockMaxTTL=%v 过长：反复命中也该在十几分钟内自愈", modelBlockMaxTTL)
+	}
+	if modelBlockMaxTTL < modelBlockBaseTTL {
+		t.Fatalf("封顶 %v 小于基数 %v", modelBlockMaxTTL, modelBlockBaseTTL)
+	}
+	// 退避仍需存在：base × 2^shift 必须真的超过封顶，否则 Hits 机制形同虚设
+	//（阶梯永远到不了 max，指数退避只剩前一两档）。
+	if modelBlockBaseTTL<<modelBlockShift < modelBlockMaxTTL {
+		t.Fatalf("退避到不了封顶：base<<%d = %v < max %v",
+			modelBlockShift, modelBlockBaseTTL<<modelBlockShift, modelBlockMaxTTL)
+	}
+}

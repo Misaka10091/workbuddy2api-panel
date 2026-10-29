@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/upstream-protocol.md", "reason": "出站头族、payload 改写顺序、脱敏层与三个 CN base 的唯一权威描述；本任务三处改动都落在它管辖的包内，且第 9 节要求改完后同步它"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误分类顺序与处置矩阵；6020/6021 由 fail-fast 503 改为请求内轮转 + 429 是对该文件铁律 #2 的有意反转，必须按它的分类顺序与罚号边界实现"}
+{"file": ".trellis/spec/backend/config-and-hot-reload.md", "reason": "新增 cn.billing_base 属装配期字段，必须同时进 restartRequiredFields 并在 normalize/Default 走唯一解析路径"}
+{"file": ".trellis/spec/backend/pool-lifecycle.md", "reason": "11102/11158 负缓存冷却矩阵与 Hits 不落盘的现状描述，TTL 收窄后该文件两处需同步"}
+{"file": ".trellis/spec/backend/quality-and-testing.md", "reason": "测试形状、确定性手册、冻结断言清单与 go/vet/test 质量门；本任务大量反转既有断言，必须先看这里的规矩"}
+{"file": ".trellis/spec/collaboration/git-workflow.md", "reason": "分支命名 sync/upstream-*、commit type/scope、作者与 AI 署名、禁止 git add -A 的硬规则"}
+{"file": ".trellis/tasks/10-28-sync-upstream-p0-contract/design.md", "reason": "本任务的技术设计与十项裁决（含哪些上游改法不能照搬、分层落点、兼容性矩阵）"}
+{"file": ".trellis/tasks/10-28-sync-upstream-p0-contract/implement.md", "reason": "三个提交的逐步执行清单、复查门与回滚点，实现方按它推进即可"}

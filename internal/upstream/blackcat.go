@@ -51,7 +51,8 @@ func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
 			"stream":   true,
 		})
-		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{})
+		// 夜猫子对话属辅助链：X-Agent-Type: auxiliary（见 AgentTypeAuxiliary）。
+		rc, status, respBody, err := c.ChatStream(a, body, "", ChatMeta{AgentType: AgentTypeAuxiliary})
 		if err != nil || status >= 400 {
 			if rc != nil {
 				rc.Close()

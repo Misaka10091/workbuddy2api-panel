@@ -62,9 +62,12 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrUpstreamBusy:
-		// 渠道级容量信号（6020 queue.waiting / 6021 queue.full）：换号打的是同一堵墙，
-		// 客户端唯一有效的动作是等一小会儿再重试（网关已带 Retry-After）。
-		return "upstream channel is at capacity (queue waiting/full); retry after a short wait — switching accounts will not help"
+		// 渠道级排队/容量信号（6020 queue.waiting / 6021 queue.full）：队列按
+		// client_user_type 全局共享，换号绕不过排队本身——网关已在本请求内轮转过
+		// 每个号，客户端唯一有效的动作是按 Retry-After 等一小会儿再重试。
+		// 这里不再写「switching accounts will not help」：改成轮转后那句话会让运维
+		// 误读成「网关没在换号」，与实现相反。
+		return "upstream channel is at capacity (queue waiting/full); the gateway already rotated accounts and the queue is shared per user type — retry after the delay given in Retry-After"
 	case ErrToolMismatch:
 		// 11148：请求内容级配对断裂，上游明示「直接重试无效，请新建任务」。
 		return "tool calls and tool results do not match in this request; start a new conversation (retrying the same body fails identically)"

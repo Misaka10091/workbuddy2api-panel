@@ -241,6 +241,45 @@ func TestParseSoftRateReset(t *testing.T) {
 	}
 }
 
+// TestParseQueueRetryAfter 6020/6021 排队等待口径来自 body 的 data.retry_after
+// （整数秒），不在响应头——上游真机 429 + code 6020 的头侧没有任何等待信息，
+// ParseRetryAfter 拿不到，只能解结构化字段。
+//
+// 守护的语义：① 只认 data.retry_after（msg 是 i18n 键、requestId 里的数字不误伤）；
+// ② 缺失/非法/非正 → false（调用方回落本地兜底 5s，不臆造等待时长）；
+// ③ 异常大值按 retryAfterSanity 封顶（上游 estimated_wait 是另一个字段、量级不像
+// 秒级口径，显式不认）。
+func TestParseQueueRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+		ok   bool
+	}{
+		{"6020 真机形态", `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`, 40 * time.Second, true},
+		{"retry_after=0（不该出现的边界）", `{"code":6020,"data":{"retry_after":0}}`, 0, false},
+		{"6021 无 data（queue.full 无等待口径）", `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea"}`, 0, false},
+		{"非 JSON", `upstream unavailable`, 0, false},
+		{"空 body", ``, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseQueueRetryAfter([]byte(c.body))
+			if ok != c.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+			}
+			if ok && got != c.want {
+				t.Errorf("got=%v want %v", got, c.want)
+			}
+		})
+	}
+	// 上限封顶：异常大的 retry_after 按 retryAfterSanity 截断，不把天文数字带回
+	//（防上游口径漂移）。
+	if d, ok := parseQueueRetryAfter([]byte(`{"code":6020,"data":{"retry_after":999999}}`)); !ok || d != retryAfterSanity {
+		t.Errorf("cap: got=%v,%v want %v,true", d, ok, retryAfterSanity)
+	}
+}
+
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -524,15 +563,21 @@ func TestDailyCheckinAlready(t *testing.T) {
 }
 
 // TestDefaultCNChatBaseIsWorkbuddyCN 缺省 CN 主域必须是官方桌面端 product.json 的
-// endpoint；billing 保持 codebuddy.cn（CLI 任务计分依赖），global 不受影响。
+// endpoint；billing 域**同批切到 workbuddy.cn**（5.9.3 真机 billing 族 host 全是它），
+// global 不受影响。
+//
+// 反转点（2026-10-28，上游 8ecf115）：旧断言是 billing == codebuddy.cn（按「CLI 指纹域」
+// 推的），真机逐条抓包否证——checkin-activity-status 23 条、get-user-resource-* 12 条、
+// /activity/growth/* 13 条、trial + pay 5 条全部打 www.workbuddy.cn 且全 200。
+// 新语义：两个 CN base 同域，旧口径可用 cn.billing_base 回填。
 func TestDefaultCNChatBaseIsWorkbuddyCN(t *testing.T) {
 	c := New()
 	cn := &auth.Auth{Domain: ""}
 	if got := c.chatBase(cn); got != "https://www.workbuddy.cn" {
 		t.Errorf("CN chat base=%q want https://www.workbuddy.cn（官方桌面端主入口）", got)
 	}
-	if got := c.billingBase(cn); got != "https://www.codebuddy.cn" {
-		t.Errorf("billing base=%q want https://www.codebuddy.cn（CLI 任务计分依赖）", got)
+	if got := c.billingBase(cn); got != "https://www.workbuddy.cn" {
+		t.Errorf("billing base=%q want https://www.workbuddy.cn（5.9.3 真机 billing 族 host）", got)
 	}
 	if got := c.webBase(cn); got != "https://www.workbuddy.cn" {
 		t.Errorf("web base=%q want https://www.workbuddy.cn", got)

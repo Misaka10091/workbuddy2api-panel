@@ -115,6 +115,18 @@ func (a *Auth) TokenSource() string {
 	return jwtClaim(a.AccessTokenValue(), "token_source")
 }
 
+// IdSource 解出 access token JWT 里的 id_source 声明（= 官方客户端的
+// X-Id-Source 取值 / X-Userinfo 的 id_source 段）。非 JWT / 无该声明 → ""。
+//
+// 与 TokenSource 同一套解码（jwtClaim），也同样是每次现解码不缓存：RefreshToken
+// 会整体换发 token，id_source 可能随重新授权翻转。
+func (a *Auth) IdSource() string {
+	if a == nil {
+		return ""
+	}
+	return jwtClaim(a.AccessTokenValue(), "id_source")
+}
+
 // jwtClaim 解出 JWT payload 里的指定字符串声明；非 JWT / 解码失败返回空。
 // 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
 func jwtClaim(token, name string) string {

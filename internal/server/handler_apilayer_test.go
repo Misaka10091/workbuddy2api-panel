@@ -5,14 +5,37 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestChatQueueFullFailsFastWithRetryAfter 6021 队列满：渠道级容量信号，
-// 不罚号不轮转，503 + Retry-After 透传原文。
-func TestChatQueueFullFailsFastWithRetryAfter(t *testing.T) {
+// fastRotation 让轮转退避不真睡：rotateBackoffBase 是包级 var，本包无 t.Parallel
+// 用例，逐用例存取即可。退避时长本身由 backoff.go 的界断言覆盖；聊天路径的用例
+// 只关心「轮了几个号、最终映射成什么」。
+func fastRotation(t *testing.T) {
+	t.Helper()
+	old := rotateBackoffBase
+	rotateBackoffBase = 0
+	t.Cleanup(func() { rotateBackoffBase = old })
+}
+
+// TestChatQueueBusyRotatesThen429WithoutPenalty 6020/6021 渠道级排队：**不罚号但换号
+// 重试**，轮转耗尽后回 429 + Retry-After，上游原文原样透传。
+//
+// 本用例反转了原 TestChatQueueFullFailsFastWithRetryAfter 的断言（旧：fail-fast 503、
+// good 号 0 次调用）。反转后的语义：上游对 6020/6021 本身回 429（6020 还带
+// data.retry_after），而 WorkBuddy CLI 对 503 直接中断任务（2026-10-28 实案：两次 503
+// 后任务死亡）、对 429 按 Retry-After 自动重发；排队可用性又是间歇的（同实案 33 秒内
+// 同模型恢复），所以恢复请求内轮转、终态透传 429。
+// 「零惩罚」一字未改：2026-10-15 整池停摆的成因是「把排队当账号故障罚号」，不是换号，
+// 本轮保留零动作分支，成因已切开。
+// 原用例**没有断言 calls**，这正是 fail-fast 一直没被发现的原因——新版必须查。
+func TestChatQueueBusyRotatesThen429WithoutPenalty(t *testing.T) {
+	fastRotation(t)
+	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
 		return 429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`, false
 	})
 	p := testPoolWith(
@@ -26,21 +49,101 @@ func TestChatQueueFullFailsFastWithRetryAfter(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("code=%d body=%s (want 503 渠道容量)", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429：轮转耗尽后的可重试排队语义，非 503)", rec.Code, rec.Body)
 	}
-	if rec.Header().Get("Retry-After") == "" {
-		t.Error("渠道排队必须带 Retry-After（客户端据此退避）")
+	// 6021 body 没有 data.retry_after → 本地兜底 5s（口径与旧 fail-fast 分支一致）。
+	if ra := rec.Header().Get("Retry-After"); ra != "5" {
+		t.Errorf("Retry-After=%q want 5（上游未给等待口径时的本地兜底）", ra)
 	}
-	if !strings.Contains(rec.Body.String(), "6021") {
-		t.Errorf("应透传上游原文（含 code/requestId）: %s", rec.Body)
+	if !strings.Contains(rec.Body.String(), "6021") || !strings.Contains(rec.Body.String(), "b1bc87ea") {
+		t.Errorf("429 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
 	}
-	// 不罚号：不冷却、不禁用、不记熔断。
+	// 轮转证据：两号各一次（tried 保证不重复选号）。
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want 两号各一次（请求内轮转，非 fail-fast）", calls)
+	}
+	// 零惩罚：无冷却、无禁用、无熔断计数、无连败累计。
 	for _, uid := range []string{"bad", "good"} {
 		st, _ := p.Status(uid)
-		if st.Cooling || st.Disabled || st.BreakerFails != 0 {
-			t.Errorf("账号 %s 不应被罚: %+v", uid, st)
+		if st.Cooling || st.Disabled || st.BreakerFails != 0 || st.ErrTotal != 0 {
+			t.Errorf("账号 %s 不得因排队被罚: %+v", uid, st)
 		}
+	}
+}
+
+// TestChatQueueWaitingRetryAfterFromBody 6020 排队的等待口径在 body
+// （data.retry_after=40），不在响应头：端到端必须把它透成 Retry-After 头，而不是
+// 落 5s 兜底。上游真机形态（2026-10-28）连 estimated_wait=12510 一起给，只认
+// retry_after（见 parseQueueRetryAfter）。
+func TestChatQueueWaitingRetryAfterFromBody(t *testing.T) {
+	fastRotation(t)
+	const upstreamBody = `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, upstreamBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "q1", AccessToken: "at-q1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s want 429", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "40" {
+		t.Errorf("Retry-After=%q want 40（body data.retry_after 透传，非本地兜底）", ra)
+	}
+	// message 不替换：仍是上游原文（含 queue_position / retry_after）。
+	if !strings.Contains(rec.Body.String(), "queue.waiting.title") {
+		t.Errorf("message 应原样透传上游原文: %s", rec.Body)
+	}
+	// 排队不罚号：单号池也必须保持健康（下一轮请求照常参与选号）。
+	if st, _ := p.Status("q1"); st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("排队不得罚号: %+v", st)
+	}
+}
+
+// TestChatQueueBusyThenQuotaBlockEmitsNoRetryAfter 排队（6020/6021）与模型级**用量配额**
+// （6004）在同一次请求里相遇时，末端描述的是配额，必须仍然遵守「配额分支不发
+// Retry-After」这条硬约定：客户端普遍把该头当「睡多久」的指令，而配额窗口内睡完重试
+// 一样失败（见 modelBlockAllQuota 处的注释）。
+//
+// 为什么需要这条用例：retryAfterSec 本轮上移到 `var ue` 之前，与 ErrUpstreamBusy
+// （排队 → 429 + 兜底 5s）共用同一个写头出口。若不在模型级覆盖前显式归零，排队兜底的
+// 5s 会随着配额响应一起报出去，客户端于是安静地睡 5 秒再撞同一堵配额墙——这正是硬约定
+// 要避免的形态。
+//
+// 构造：bad 号先撞排队，且在该次上游调用期间被后台判死（模拟该号并发失效），于是下一轮
+// 选号只剩「该模型 6004 配额冷却」的 good 号，末端走 quota 分支。
+func TestChatQueueBusyThenQuotaBlockEmitsNoRetryAfter(t *testing.T) {
+	fastRotation(t)
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// good 号对该模型处于 6004 用量配额冷却（上游权威重置墙钟 2h 后）。
+	p.CooldownSoftForModel("good", 10*time.Minute, time.Now().Add(2*time.Hour), "glm-5.2", "6004 model rate limit")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 排队响应回来时 bad 号被后台判死：下一轮选号不再有可用号。
+		p.Disable("bad", "concurrent session dead")
+		return 429, `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea"}`, false
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s want 429（配额语义）", rec.Code, rec.Body)
+	}
+	// 配额响应用上游业务码形态（6004），不是 upstream_busy。
+	if !strings.Contains(rec.Body.String(), "6004") {
+		t.Errorf("body 应是 6004 配额形态: %s", rec.Body)
+	}
+	// 硬约定：配额分支不得发 Retry-After（排队分支的 5s 兜底不许漏进来）。
+	if ra := rec.Header().Get("Retry-After"); ra != "" {
+		t.Errorf("Retry-After=%q want 空（6004 配额分支不发该头，否则客户端静默挂起）", ra)
 	}
 }
 

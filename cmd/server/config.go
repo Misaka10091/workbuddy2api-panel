@@ -126,6 +126,12 @@ type Config struct {
 		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
 		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
+		// BillingBase 国内版 billing 域（签到 / 余额 / 领取 / trial）上游 base 覆盖；
+		// 空 = 回落内置默认 https://www.workbuddy.cn（5.9.3 真机 billing 族 host 全是
+		// www.workbuddy.cn）。旧口径 codebuddy.cn 可用本键回填——两处（面板余额与
+		// cmd/credit 查积分）必须填同一个值，否则余额会互相矛盾。
+		// 与 cn.chat_base 同规格：装配期写入 Client，改它需重启。
+		BillingBase string `json:"billing_base"`
 	} `json:"cn"`
 
 	Global struct {
@@ -153,9 +159,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（按 realm：CN 5.8.3 / global 5.8.4 分发包）。
+		// X-IDE-Version）。空 = 内置默认（按 realm：CN 5.9.3 / global 5.8.4 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.161.0）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.165.0）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。

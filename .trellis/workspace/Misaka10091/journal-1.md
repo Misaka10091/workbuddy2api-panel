@@ -73,3 +73,28 @@ P1 频控 / P2 状态落盘 / P3 观测与暴露面四组移植，48 文件、+2
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 同步上游 P0：出站契约 5.9.3 / 11-128 抢救 / 6020-6021 排队
+<!-- trellis-session: v=2 fp=1044e7c9da0fa003 -->
+
+**Date**: 2026-10-29
+**Task**: 同步上游 P0：出站契约 5.9.3 / 11-128 抢救 / 6020-6021 排队
+**Branch**: `sync/upstream-p0-contract`
+
+### Summary
+
+把上游 5367e78..80e844f 的三项 P0 改动移植到本仓，按三个可独立回滚的提交落地：①出站契约对齐 WorkBuddy 5.9.3（删客户端从不发的头、补必发的头、版本 5.9.3/CLI 2.165.0、ID 改 UUIDv7、report 改走 chatBase、chat body 按 1KB gzip，新增五条路径黄金头集回归）；②11-128 抢救（DSH @ 路径段整段改写、身份句式整句中性化、enum 补推断类型、三级抢救改成拆句优先，并修正三级抢救吃掉 MaxRotate 的回归）；③6020/6021 请求内轮转 + 429+Retry-After（零惩罚保留）、11102 负缓存 TTL 6h/24h 收窄到 2m/10m 并钳制存量条目。四个 spec 同批同步。go build/vet/test 全绿（基线同样全绿）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `17f7d86` | fix(upstream): 出站契约对齐 WorkBuddy 5.9.3 |
+| `27396a0` | fix(upstream,prompt,server): 11-128 抢救——@ 路径段/身份句式/system 拆句 |
+| `562442e` | fix(server,pool): 6020/6021 请求内轮转 + 429；11102 负缓存 TTL 收窄 |
+| `304f92e` | chore(trellis): 记录上游 P0 同步任务（prd/design/implement/research） |
+
+### Status
+
+[OK] **Completed**

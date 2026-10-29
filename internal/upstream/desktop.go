@@ -1,11 +1,11 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.5.6）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop 5.9.3）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
 // **不同的客户端指纹**：
 //
-//	POST https://www.workbuddy.cn/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0（CN；global 走 workbuddy-ai）
+//	POST https://www.workbuddy.cn/v2/report        ← chatBase（桌面与 CLI 上报同一通道）
+//	User-Agent: WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0（CN；global 走 workbuddy-ai）
 //	X-Domain: www.workbuddy.cn, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
@@ -29,10 +29,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -44,12 +42,13 @@ const (
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
 	// desktopVersion* / desktopCommit* / desktopReleaseDate* 官方分发包实测三元组。
 	// 两版分发包不同 → 三元组不同，故**按 realm 分开**：
-	//   CN 5.8.3（www.workbuddy.cn） / global 5.8.4（www.workbuddy.ai）。
+	//   CN 5.9.3（www.workbuddy.cn，2026-10-28 上游 47f1ed6 真机复核）
+	//   global 5.8.4（www.workbuddy.ai，无新版抓包证据 → 不动）。
 	// 上报体里的 ideVersion/extVersion/commit/releaseDate 与 UA 必须同源同版本：
 	// 版本段彼此不一致本身就是可判别的指纹。
-	desktopVersionCN         = "5.8.3"
-	desktopCommitCN          = "db0e9b51b7fa0b383f41f5b0b83dd442c8557918"
-	desktopReleaseDateCN     = int64(1792029498676)
+	desktopVersionCN         = "5.9.3"
+	desktopCommitCN          = "d46924219e79332f49c37ccebf27292f87001b19"
+	desktopReleaseDateCN     = int64(1793093056315)
 	desktopVersionGlobal     = "5.8.4"
 	desktopCommitGlobal      = "73952edb48da46bd0b244661efe22f4f247c4977"
 	desktopReleaseDateGlobal = int64(1792063084107)
@@ -70,24 +69,21 @@ func desktopTriple(a *auth.Auth) (ver, commit string, release int64) {
 // desktopUAFor 桌面端 UA：两段品牌一致（与业务链路同源，都是 SDK 的 buildUserAgent），
 // 与 chat UA（首段恒驼峰 `WorkBuddy`）刻意不同：
 //
-//	CN     → WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0
-//	global → workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0
-func desktopUAFor(a *auth.Auth) string {
+//	CN     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	global → workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0
+//
+// 与上游的一处**有意差异**：CLI 段走 c.cliVersion()（而不是直接用 defaultCliVersion），
+// 让 config upstream.cli_version 对 report/上报路径同样生效。上游那版让该配置在
+// /v2/report 上静默失效，属于瑕疵，不照抄。
+func (c *Client) desktopUAFor(a *auth.Auth) string {
 	ver, _, _ := desktopTriple(a)
 	brand := uaBrandFor(a)
-	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + defaultCliVersion
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion()
 }
 
-// desktopHost 返回 X-Domain 用的裸主机名（与真机一致：www.workbuddy.ai /
-// copilot.tencent.com）。从 base 里剥 scheme 与路径；解析失败时退回 base 原串，
-// 保证不会因为 URL 畸形而把该头发成空串（头缺失同样会触发渠道校验）。
-func (c *Client) desktopHost(a *auth.Auth) string {
-	base := c.desktopBase(a)
-	if u, err := url.Parse(base); err == nil && u.Hostname() != "" {
-		return u.Hostname()
-	}
-	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
-}
+// 原 desktopHost 已删（2026-10-28）：/v2/report 改走 reportHeaders 后它没有调用方，
+// 而它本就是 chatHost 的同义包装（desktopBase == chatBase）。host 解析只留
+// headers.go 的 hostOf/chatHost 一份，避免两处再次漂移。
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
@@ -168,20 +164,8 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(a))
-	// X-Domain 是**主机名**不是 URL：真机实测 `X-Domain: www.workbuddy.ai`，
-	// 而 desktopBase 返回的是带 scheme 的 base，直接塞进去会发成
-	// `https://www.workbuddy.ai`——与本仓其它头（chat/billing 用裸域）也不自洽，
-	// 是最容易被上游按「非客户端形态」识别出来的一处。
-	req.Header.Set("X-Domain", c.desktopHost(a))
-	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", session.NewMessageID())
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
-	}
+	// 头族与 chat 活跃上报共用 reportHeaders（9 键黄金集）：两处各写一份会再次漂移。
+	c.reportHeaders(req, a)
 	_, err = c.doJSON(req)
 	return err
 }
@@ -276,7 +260,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(a))
+	req.Header.Set("User-Agent", c.desktopUAFor(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -453,7 +437,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUAFor(a))
+	req.Header.Set("User-Agent", c.desktopUAFor(a))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {

@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"strings"
 )
 
@@ -584,16 +585,27 @@ func normalizeToolPatterns(obj map[string]any) {
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			unescapePatternLiteralEscapes(fn["parameters"])
+			normalizeSchemaTree(fn["parameters"])
 		}
-		unescapePatternLiteralEscapes(tool["parameters"])
+		normalizeSchemaTree(tool["parameters"])
 	}
 }
 
-// unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
-// 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建
-// 该层）。
-func unescapePatternLiteralEscapes(node any) {
+// normalizeSchemaTree 递归归一化 schema 树，干两件事：
+//  1. pattern 值与 patternProperties 键中的 `\_` → `_`（patternProperties 的键也是
+//     正则；map 键不可原地改，命中时重建该层）；
+//  2. `type` 缺失但 `enum` 非空时，按 inferEnumType 无损补上类型（上游 49f9db4）。
+//
+// 第 2 件事的来源：Kimi 系对参数 schema 严格校验，缺 type 的 enum 直接 400 11133
+// 「Invalid request parameters」——同一个模型对带这类 schema 的客户端等于全废。类型能
+// 无损推断就补上，推断不出来（混合标量 / 含 null）保持原样，让上游按原语义报错，不猜。
+//
+// 两条边界必须钉住：
+//   - `enum` 取值一字不改（只补 `type`，不动枚举内容）；
+//   - `response_format` 天然不走这条——入口只有 `normalizeToolPatterns` 的
+//     `obj["tools"]`，而 response_format 的 enum 是**输出约束**，补错类型会改变模型被
+//     约束的方式（tools 的 enum 是入参契约，补类型只是让上游校验通过）。
+func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
@@ -613,12 +625,58 @@ func unescapePatternLiteralEscapes(node any) {
 				n["patternProperties"] = fixed
 			}
 		}
+		// enum 缺 type：见函数注释。插在 patternProperties 之后、递归之前——递归自然
+		// 覆盖 items / anyOf / $defs / 数组形态。只在 type 缺失时补，显式写了的
+		// （如 {"type":"string","enum":["p"]}）不动。
+		if _, hasType := n["type"]; !hasType {
+			if e, ok := n["enum"].([]any); ok && len(e) > 0 {
+				if t := inferEnumType(e); t != "" {
+					n["type"] = t
+				}
+			}
+		}
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	case []any:
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	}
+}
+
+// inferEnumType 从 enum 取值推断 JSON Schema 类型；推不出唯一类型时返回空（不改写）。
+//
+// 数字经 encoding/json 解出来一律是 float64，故按「全为整数值」区分 integer / number。
+// 判定顺序即 switch 顺序：全整数 → integer、含小数 → number、全布尔 → boolean、
+// 全串 → string；混合标量 / 含 null（以及对象 / 数组）→ 空串，不猜。
+func inferEnumType(values []any) string {
+	var strs, nums, ints, bools int
+	for _, v := range values {
+		switch x := v.(type) {
+		case string:
+			strs++
+		case bool:
+			bools++
+		case float64:
+			nums++
+			if x == math.Trunc(x) {
+				ints++
+			}
+		default:
+			return "" // null / 对象 / 数组：类型不唯一，不猜
+		}
+	}
+	n := len(values)
+	switch {
+	case strs == n:
+		return "string"
+	case bools == n:
+		return "boolean"
+	case nums == n && ints == n:
+		return "integer"
+	case nums == n:
+		return "number"
+	}
+	return ""
 }

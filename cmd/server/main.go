@@ -414,6 +414,7 @@ func main() {
 
 // applyCNChatBase 应用国内版 chat base 覆盖：空 = 保持内置默认
 // https://www.workbuddy.cn；非空 = 覆盖（备选入口 copilot.tencent.com 等）。
+// 同时应用 cn.billing_base（同规格装配期字段，见 applyCNBillingBase）。
 // 装配期一次性写入：chatBase() 在请求路径并发读取 ChatBaseCN，不做热改，
 // 因此该键同时列进 restartRequiredFields。
 func applyCNChatBase(up *upstream.Client, cfg *Config) {
@@ -422,6 +423,22 @@ func applyCNChatBase(up *upstream.Client, cfg *Config) {
 	}
 	if cfg.CN.ChatBase != "" {
 		up.ChatBaseCN = cfg.CN.ChatBase
+	}
+	applyCNBillingBase(up, cfg)
+}
+
+// applyCNBillingBase 应用国内版 billing base 覆盖：空 = 保持内置默认
+// https://www.workbuddy.cn（5.9.3 真机 billing 族 host 全是它）；非空 = 覆盖
+// （旧口径 https://www.codebuddy.cn 可用本键回填）。
+//
+// 与 cn.chat_base 同规格：装配期一次性写入 up.BillingBaseCN，请求路径并发只读，
+// 故 cn.billing_base 也**无条件**列进 restartRequiredFields。
+func applyCNBillingBase(up *upstream.Client, cfg *Config) {
+	if up == nil || cfg == nil {
+		return
+	}
+	if cfg.CN.BillingBase != "" {
+		up.BillingBaseCN = cfg.CN.BillingBase
 	}
 }
 
@@ -649,6 +666,10 @@ func restartRequiredFields(c *Config) []string {
 	// 才列入，则「覆盖值 → 清空」这一非对称改动会静默失效——文件保存成功、面板显示
 	// 已生效，但运行中的 ChatBaseCN 仍是旧覆盖值（与 upstream.user_agent 同一教训）。
 	out = append(out, "cn.chat_base")
+	// cn.billing_base 同 cn.chat_base：装配期写进 up.BillingBaseCN（billingBase()
+	// 请求路径并发读取）。同样**无条件**列入，理由与上面完全相同——「覆盖值 → 清空」
+	// 必须提示重启，否则运行中的 BillingBaseCN 仍是旧覆盖值。
+	out = append(out, "cn.billing_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

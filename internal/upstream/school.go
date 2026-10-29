@@ -7,7 +7,8 @@
 //     webchat 普通会话不计数，纯 API 不做（需小程序内人工对话）。
 //   - 抽奖：POST /wheel/draw {draw_uuid}（前端生成 uuid，消耗 1 chance）。
 //
-// 端点基址 www.codebuddy.cn（billing 同域）；信封 {code,msg,data}，code=0 成功。
+// 端点基址是 billing 域（2026-10-28 起默认 www.workbuddy.cn，旧口径 codebuddy.cn 可用
+// cn.billing_base 回填）；信封 {code,msg,data}，code=0 成功。
 package upstream
 
 import (
@@ -80,7 +81,10 @@ func mpEventBase(a *auth.Auth) map[string]any {
 	}
 }
 
-// ReportMPEvent 以小程序指纹向 www.codebuddy.cn/v2/report 批量上报事件。
+// ReportMPEvent 以小程序指纹向 {billingBase}/v2/report 批量上报事件。
+//
+// 注意本函数直读 c.BillingBaseCN（不走 billingBase(a)）：cn.billing_base 回填对它同样
+// 生效（装配期写的就是该字段），但 global 账号也会打到 CN 域——既有行为，本轮未改。
 func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	if len(events) == 0 {
 		return fmt.Errorf("mp report: no events")
